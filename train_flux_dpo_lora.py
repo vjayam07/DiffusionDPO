@@ -160,6 +160,7 @@ def score_images(hps_model, hps_preprocess, hps_tokenizer, images, prompts, devi
 
 def load_flux_models(args, device):
     """Load FLUX transformer, VAE, and scheduler; apply LoRA."""
+    import gc
     from diffusers import FluxPipeline, FlowMatchEulerDiscreteScheduler
     from peft import LoraConfig, get_peft_model
 
@@ -172,6 +173,12 @@ def load_flux_models(args, device):
     vae = pipe.vae
     scheduler = pipe.scheduler
 
+    # Free text encoders — not needed since we use precomputed embeddings.
+    # T5-XXL alone is ~22GB in bf16.
+    del pipe.text_encoder, pipe.text_encoder_2
+    del pipe
+    gc.collect()
+
     # Freeze everything
     transformer.requires_grad_(False)
     vae.requires_grad_(False)
@@ -182,6 +189,7 @@ def load_flux_models(args, device):
         lora_alpha=args.lora_alpha,
         target_modules=["to_k", "to_q", "to_v", "to_out.0"],
         lora_dropout=0.0,
+        autocast_adapter_dtype=False,  # Avoid PEFT enumerating float8 dtypes missing in PyTorch 2.5
     )
     transformer = get_peft_model(transformer, lora_config)
     transformer.print_trainable_parameters()
@@ -189,7 +197,7 @@ def load_flux_models(args, device):
     vae = vae.to(device)
     vae.eval()
 
-    return transformer, vae, scheduler, pipe
+    return transformer, vae, scheduler
 
 
 # ---------------------------------------------------------------------------
@@ -431,12 +439,13 @@ def dpo_training_step(transformer, vae, batch, latents_w, latents_l, args, devic
         transformer.enable_adapters()
 
     # --- DPO loss (from DiffusionDPO paper, adapted for flow matching) ---
-    model_losses_w = (model_pred_w - target_w).pow(2).mean(dim=[1, 2, 3])
-    model_losses_l = (model_pred_l - target_l).pow(2).mean(dim=[1, 2, 3])
+    # Cast to float32 for stable loss computation (matches original DiffusionDPO)
+    model_losses_w = (model_pred_w.float() - target_w.float()).pow(2).mean(dim=[1, 2, 3])
+    model_losses_l = (model_pred_l.float() - target_l.float()).pow(2).mean(dim=[1, 2, 3])
     model_diff = model_losses_w - model_losses_l
 
-    ref_losses_w = (ref_pred_w - target_w).pow(2).mean(dim=[1, 2, 3])
-    ref_losses_l = (ref_pred_l - target_l).pow(2).mean(dim=[1, 2, 3])
+    ref_losses_w = (ref_pred_w.float() - target_w.float()).pow(2).mean(dim=[1, 2, 3])
+    ref_losses_l = (ref_pred_l.float() - target_l.float()).pow(2).mean(dim=[1, 2, 3])
     ref_diff = ref_losses_w - ref_losses_l
 
     raw_model_loss = 0.5 * (model_losses_w.mean() + model_losses_l.mean())
@@ -740,7 +749,7 @@ def main():
     random.seed(args.seed + rank)
 
     # --- Load models ---
-    transformer, vae, scheduler, pipe = load_flux_models(args, device)
+    transformer, vae, scheduler = load_flux_models(args, device)
 
     if args.gradient_checkpointing:
         transformer.gradient_checkpointing_enable()
