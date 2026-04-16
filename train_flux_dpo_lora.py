@@ -65,15 +65,14 @@ def unpack_latents(latents: torch.Tensor, h: int, w: int, vae_scale_factor: int 
     return latents
 
 
-def prepare_latent_image_ids(batch_size: int, h: int, w: int, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
-    """Create image position IDs for FLUX transformer."""
+def prepare_latent_image_ids(h: int, w: int, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
+    """Create image position IDs for FLUX transformer (2D, no batch dim)."""
     lh = h // 2  # after packing
     lw = w // 2
     ids = torch.zeros(lh, lw, 3, device=device, dtype=dtype)
     ids[..., 1] = torch.arange(lh, device=device, dtype=dtype)[:, None]
     ids[..., 2] = torch.arange(lw, device=device, dtype=dtype)[None, :]
     ids = ids.reshape(lh * lw, 3)
-    ids = ids.unsqueeze(0).expand(batch_size, -1, -1)
     return ids
 
 
@@ -301,7 +300,7 @@ def generate_latents(transformer, scheduler, batch, args, device):
     text_ids = text_ids.repeat_interleave(K, dim=0)
 
     BK = B * K
-    latent_image_ids = prepare_latent_image_ids(BK, lh, lw, device, torch.bfloat16)
+    latent_image_ids = prepare_latent_image_ids(lh, lw, device, torch.bfloat16)
 
     # Initialize noise
     latents = torch.randn(BK, C, lh, lw, device=device, dtype=torch.bfloat16)
@@ -351,9 +350,10 @@ def decode_latents(vae, latents):
     """Decode latents to PIL images."""
     # FLUX VAE scaling
     latents = (latents / vae.config.scaling_factor) + vae.config.shift_factor
-    images = vae.decode(latents.float()).sample
-    images = (images / 2 + 0.5).clamp(0, 1)
-    images = images.permute(0, 2, 3, 1).cpu().float().numpy()
+    # Decode in VAE's native dtype (bf16), then cast output to float32 for numpy
+    images = vae.decode(latents).sample
+    images = (images.float() / 2 + 0.5).clamp(0, 1)
+    images = images.permute(0, 2, 3, 1).cpu().numpy()
     pil_images = [Image.fromarray((img * 255).astype(np.uint8)) for img in images]
     return pil_images
 
@@ -378,7 +378,7 @@ def dpo_training_step(transformer, vae, batch, latents_w, latents_l, args, devic
     prompt_embeds = batch["prompt_embeds"].to(device, dtype=torch.bfloat16)
     pooled_prompt_embeds = batch["pooled_prompt_embeds"].to(device, dtype=torch.bfloat16)
     text_ids = batch["text_ids"].to(device, dtype=torch.bfloat16)
-    latent_image_ids = prepare_latent_image_ids(B, lh, lw, device, torch.bfloat16)
+    latent_image_ids = prepare_latent_image_ids(lh, lw, device, torch.bfloat16)
 
     # Sample random sigma (timestep) for each item in batch
     sigma = torch.rand(B, device=device, dtype=torch.bfloat16)
@@ -540,7 +540,7 @@ def calibrate_compute_tracker(tracker, transformer, vae, hps_model, hps_tokenize
     # Dummy inputs matching actual shapes
     z = torch.randn(1, C, lh, lw, device=device, dtype=torch.bfloat16)
     z_packed = pack_latents(z, args.h, args.w)
-    image_ids = prepare_latent_image_ids(1, lh, lw, device, torch.bfloat16)
+    image_ids = prepare_latent_image_ids(lh, lw, device, torch.bfloat16)
     encoder_hidden_states = torch.zeros(1, 512, 4096, device=device, dtype=torch.bfloat16)
     pooled_prompt_embeds = torch.zeros(1, 768, device=device, dtype=torch.bfloat16)
     text_ids = torch.zeros(1, 512, 3, device=device, dtype=torch.bfloat16)
@@ -655,7 +655,7 @@ def eval_and_log_images(args, transformer, vae, dataset, device, step,
         z = torch.randn(1, C, lh, lw, device=device, dtype=torch.bfloat16,
                         generator=generator)
         z_packed = pack_latents(z, args.h, args.w)
-        image_ids = prepare_latent_image_ids(1, lh, lw, device, torch.bfloat16)
+        image_ids = prepare_latent_image_ids(lh, lw, device, torch.bfloat16)
 
         # Deterministic Euler sampling
         for i in range(args.sampling_steps):
