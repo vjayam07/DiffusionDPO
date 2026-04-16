@@ -474,6 +474,87 @@ def save_lora_checkpoint(transformer, optimizer, step, output_dir):
 
 
 # ---------------------------------------------------------------------------
+# Compute tracking: calibration
+# ---------------------------------------------------------------------------
+
+def calibrate_compute_tracker(tracker, transformer, vae, hps_model, hps_tokenizer,
+                              device, args):
+    """Measure actual FLOPs for each phase using FlopCounterMode.
+
+    Runs one forward pass of each component with real-shaped inputs to calibrate
+    the tracker. Called once before the training loop.
+    """
+    lh = args.h // 8
+    lw = args.w // 8
+    C = 16
+
+    # Dummy inputs matching actual shapes
+    z = torch.randn(1, C, lh, lw, device=device, dtype=torch.bfloat16)
+    z_packed = pack_latents(z, args.h, args.w)
+    image_ids = prepare_latent_image_ids(1, lh, lw, device, torch.bfloat16)
+    encoder_hidden_states = torch.zeros(1, 512, 4096, device=device, dtype=torch.bfloat16)
+    pooled_prompt_embeds = torch.zeros(1, 768, device=device, dtype=torch.bfloat16)
+    text_ids = torch.zeros(1, 512, 3, device=device, dtype=torch.bfloat16)
+    timestep = torch.tensor([500.0], device=device, dtype=torch.bfloat16)
+    guidance = torch.tensor([3.5], device=device, dtype=torch.bfloat16)
+
+    # 1. Calibrate: one FLUX transformer forward pass (sampling)
+    transformer.eval()
+    with tracker.calibrate_sampling():
+        with torch.no_grad():
+            with torch.autocast("cuda", torch.bfloat16):
+                transformer(
+                    hidden_states=z_packed,
+                    timestep=timestep,
+                    encoder_hidden_states=encoder_hidden_states,
+                    pooled_projections=pooled_prompt_embeds,
+                    txt_ids=text_ids,
+                    img_ids=image_ids,
+                    guidance=guidance,
+                    return_dict=False,
+                )
+
+    # 2. Calibrate: VAE decode
+    latent_for_vae = torch.randn(1, C, lh, lw, device=device, dtype=torch.bfloat16)
+    with tracker.calibrate_vae_decode():
+        with torch.inference_mode():
+            with torch.autocast("cuda", dtype=torch.bfloat16):
+                vae.decode(latent_for_vae, return_dict=False)
+
+    # 3. Calibrate: reward model forward
+    if hps_model is not None:
+        dummy_image = torch.randn(1, 3, 224, 224, device=device)
+        dummy_text = hps_tokenizer(["a photo"]).to(device=device)
+        with tracker.calibrate_reward():
+            with torch.no_grad():
+                with torch.amp.autocast("cuda"):
+                    hps_model(dummy_image, dummy_text)
+
+    # 4. Calibrate: one DPO training step (fwd + bwd)
+    transformer.train()
+    with tracker.calibrate_training():
+        with torch.autocast("cuda", torch.bfloat16):
+            pred = transformer(
+                hidden_states=z_packed,
+                timestep=timestep,
+                encoder_hidden_states=encoder_hidden_states,
+                pooled_projections=pooled_prompt_embeds,
+                txt_ids=text_ids,
+                img_ids=image_ids,
+                guidance=guidance,
+                return_dict=False,
+            )[0]
+        loss = pred.sum()
+        loss.backward()
+    # Clear gradients from calibration
+    for p in transformer.parameters():
+        if p.grad is not None:
+            p.grad.zero_()
+
+    tracker.print_calibration_summary()
+
+
+# ---------------------------------------------------------------------------
 # Evaluation: generate fixed-seed images and log to wandb
 # ---------------------------------------------------------------------------
 
@@ -673,6 +754,16 @@ def main():
     # --- HPSv2 model ---
     hps_model, hps_preprocess, hps_tokenizer = load_hps_model(args.hps_ckpt_dir, device)
 
+    # --- Compute tracker ---
+    from utils.compute_tracker import DPOComputeTracker
+    compute_tracker = DPOComputeTracker(num_gpus=world_size)
+    if rank == 0:
+        logger.info("Calibrating compute tracker...")
+    calibrate_compute_tracker(
+        compute_tracker, transformer, vae, hps_model, hps_tokenizer,
+        device, args,
+    )
+
     # --- Training ---
     global_step = 0
     optimizer.zero_grad()
@@ -766,6 +857,13 @@ def main():
             step_time = time.time() - step_start
             step_times.append(step_time)
 
+            # === Record compute ===
+            num_samples = B * K
+            compute_tracker.record_sampling(num_samples, args.sampling_steps)
+            compute_tracker.record_vae_decode(num_samples)
+            compute_tracker.record_reward(num_samples)
+            compute_tracker.record_dpo_training(B)
+
             # === Logging ===
             mean_reward = float(np.mean(batch_rewards))
             reward_log.append(mean_reward)
@@ -784,7 +882,7 @@ def main():
                 )
 
                 # Wandb metrics
-                wandb.log({
+                log_dict = {
                     "train/dpo_loss": metrics["dpo_loss"],
                     "train/implicit_acc": metrics["implicit_acc"],
                     "train/model_mse": metrics["model_mse"],
@@ -797,7 +895,9 @@ def main():
                     "train/step_time": step_time,
                     "train/avg_step_time": avg_step_time,
                     "train/learning_rate": args.learning_rate,
-                }, step=global_step)
+                }
+                log_dict.update(compute_tracker.get_metrics())
+                wandb.log(log_dict, step=global_step)
 
             # === Save rewards ===
             if rank == 0 and global_step % args.log_every == 0:
@@ -830,12 +930,29 @@ def main():
     # Final save + eval
     if rank == 0:
         save_lora_checkpoint(transformer, optimizer, global_step, args.output_dir)
-        logger.info("Training complete!")
+
     eval_and_log_images(args, transformer, vae, dataset, device,
                         step=global_step, eval_seed=args.seed,
                         max_images=args.max_eval_images)
 
+    # Print and save compute summary
     if rank == 0:
+        logger.info("\n" + "=" * 60)
+        logger.info("COMPUTE SUMMARY")
+        logger.info("=" * 60)
+        logger.info(compute_tracker.summary())
+
+        summary_path = os.path.join(args.output_dir, "compute_summary.txt")
+        with open(summary_path, "w") as f:
+            f.write(compute_tracker.summary() + "\n")
+            f.write("\nCalibrated per-operation FLOPs:\n")
+            f.write(f"  sampling_step_flops: {compute_tracker.sampling_step_flops:,}\n")
+            f.write(f"  vae_decode_flops: {compute_tracker.vae_decode_flops:,}\n")
+            f.write(f"  reward_forward_flops: {compute_tracker.reward_forward_flops:,}\n")
+            f.write(f"  training_step_flops: {compute_tracker.training_step_flops:,}\n")
+        logger.info(f"Compute summary saved to {summary_path}")
+        logger.info("Training complete!")
+
         wandb.finish()
 
     dist.destroy_process_group()
