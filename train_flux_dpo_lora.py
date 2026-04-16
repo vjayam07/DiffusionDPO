@@ -285,7 +285,9 @@ def generate_latents(transformer, scheduler, batch, args, device):
     sigmas = sd3_time_shift(args.shift, 1.0, sigmas)
 
     # Ensure LoRA is ON during generation (we generate from current policy)
-    transformer.module.enable_adapters() if hasattr(transformer, 'module') else transformer.enable_adapters()
+    # PeftModel methods: enable_adapter_layers / disable_adapter_layers
+    peft_model = transformer.module if hasattr(transformer, 'module') else transformer
+    peft_model.enable_adapter_layers()
 
     for i in range(args.sampling_steps):
         sigma = sigmas[i]
@@ -376,10 +378,8 @@ def dpo_training_step(transformer, vae, batch, latents_w, latents_l, args, devic
     guidance_vec = torch.tensor([args.guidance], device=device, dtype=torch.bfloat16).expand(B)
 
     # --- Policy prediction (LoRA ON) ---
-    if hasattr(transformer, 'module'):
-        transformer.module.enable_adapters()
-    else:
-        transformer.enable_adapters()
+    peft_model = transformer.module if hasattr(transformer, 'module') else transformer
+    peft_model.enable_adapter_layers()
 
     # Predict for preferred
     packed_w = pack_latents(noisy_w, args.h, args.w)
@@ -410,10 +410,7 @@ def dpo_training_step(transformer, vae, batch, latents_w, latents_l, args, devic
     model_pred_l = unpack_latents(model_pred_l, args.h, args.w)
 
     # --- Reference prediction (LoRA OFF) ---
-    if hasattr(transformer, 'module'):
-        transformer.module.disable_adapters()
-    else:
-        transformer.disable_adapters()
+    peft_model.disable_adapter_layers()
 
     with torch.no_grad():
         ref_pred_w = transformer(
@@ -441,10 +438,7 @@ def dpo_training_step(transformer, vae, batch, latents_w, latents_l, args, devic
         ref_pred_l = unpack_latents(ref_pred_l, args.h, args.w)
 
     # Re-enable LoRA for gradient computation
-    if hasattr(transformer, 'module'):
-        transformer.module.enable_adapters()
-    else:
-        transformer.enable_adapters()
+    peft_model.enable_adapter_layers()
 
     # --- DPO loss (from DiffusionDPO paper, adapted for flow matching) ---
     # Cast to float32 for stable loss computation (matches original DiffusionDPO)
@@ -621,10 +615,8 @@ def eval_and_log_images(args, transformer, vae, dataset, device, step,
     all_captions = []
 
     # Ensure LoRA is ON (generate from current policy)
-    if hasattr(transformer, 'module'):
-        transformer.module.enable_adapters()
-    else:
-        transformer.enable_adapters()
+    peft_model = transformer.module if hasattr(transformer, 'module') else transformer
+    peft_model.enable_adapter_layers()
 
     for idx in range(num_eval):
         entry = dataset[idx]
