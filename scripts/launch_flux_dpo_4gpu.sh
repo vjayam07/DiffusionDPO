@@ -1,0 +1,51 @@
+#!/bin/bash
+# Launch script for Online DiffusionDPO on FLUX.1-dev with LoRA (4 GPUs)
+# Mirrors DanceGRPO's finetune_flux_grpo_4gpus_lora_a6000.sh
+
+set -euo pipefail
+
+# === Paths (shared with DanceGRPO baseline) ===
+DATA_DIR="${DATA_DIR:-/atlas2/u/vjayam/experiments/cfgrl-expo/DanceGRPO/data}"
+HPS_CKPT_DIR="${HPS_CKPT_DIR:-/atlas2/u/vjayam/experiments/cfgrl-expo/DanceGRPO/hps_ckpt}"
+OUTPUT_DIR="${OUTPUT_DIR:-/atlas2/u/vjayam/experiments/cfgrl-expo/DiffusionDPO/output_dpo_flux}"
+
+# === Create output directory ===
+mkdir -p "${OUTPUT_DIR}"
+
+echo "============================================="
+echo " Online DiffusionDPO for FLUX.1-dev (LoRA)"
+echo "============================================="
+echo "FLUX weights:  ${DATA_DIR}/flux"
+echo "Embeddings:    ${DATA_DIR}/rl_embeddings/videos2caption.json"
+echo "HPSv2 ckpt:    ${HPS_CKPT_DIR}"
+echo "Output:        ${OUTPUT_DIR}"
+echo "============================================="
+
+# === Launch training ===
+torchrun --nproc_per_node=4 --master_port 19003 \
+  train_flux_dpo_lora.py \
+  --pretrained_model_name_or_path "${DATA_DIR}/flux" \
+  --data_json_path "${DATA_DIR}/rl_embeddings/videos2caption.json" \
+  --h 512 --w 512 \
+  --sampling_steps 8 \
+  --shift 3.0 \
+  --guidance 3.5 \
+  --lora_rank 128 \
+  --lora_alpha 256 \
+  --beta_dpo 5000 \
+  --num_generations 4 \
+  --train_batch_size 1 \
+  --gradient_accumulation_steps 12 \
+  --learning_rate 3e-4 \
+  --max_train_steps 1000 \
+  --gradient_checkpointing \
+  --mixed_precision bf16 \
+  --hps_ckpt_dir "${HPS_CKPT_DIR}" \
+  --seed 42 \
+  --checkpointing_steps 100 \
+  --log_every 1 \
+  --max_grad_norm 1.0 \
+  --wandb_project "flux-dpo" \
+  --max_eval_images 9 \
+  --output_dir "${OUTPUT_DIR}" \
+  2>&1 | tee "${OUTPUT_DIR}/train.log"
