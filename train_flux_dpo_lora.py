@@ -132,7 +132,7 @@ def load_hps_model(hps_ckpt_dir: str, device: torch.device):
         with_score_predictor=False, with_region_predictor=False,
     )
     ckpt_path = os.path.join(hps_ckpt_dir, "HPS_v2_compressed.pt")
-    checkpoint = torch.load(ckpt_path, map_location=device, weights_only=True)
+    checkpoint = torch.load(ckpt_path, map_location=device, weights_only=False)
     model.load_state_dict(checkpoint["state_dict"])
     tokenizer = get_tokenizer("ViT-H-14")
     model = model.to(device).eval()
@@ -279,8 +279,8 @@ def generate_latents(transformer, scheduler, batch, args, device):
         # Pack latents for transformer
         packed = pack_latents(latents, args.h, args.w)
 
-        # Transformer forward
-        timestep = t * 1000  # FLUX expects timestep in [0, 1000]
+        # Transformer forward — FLUX expects sigma directly in [0, 1]
+        timestep = t
         noise_pred = transformer(
             hidden_states=packed,
             timestep=timestep,
@@ -347,15 +347,15 @@ def dpo_training_step(transformer, vae, batch, latents_w, latents_l, args, devic
     noisy_w = (1 - sigma) * latents_w + sigma * noise
     noisy_l = (1 - sigma) * latents_l + sigma * noise
 
-    # Target velocity: v = x_0 - noise (flow matching target)
-    target_w = latents_w - noise
-    target_l = latents_l - noise
+    # Target velocity: v = noise - x_0 (FLUX flow matching convention)
+    target_w = noise - latents_w
+    target_l = noise - latents_l
 
     # Flatten sigma for timestep input
     t = sigma.squeeze()  # (B,)
     if t.dim() == 0:
         t = t.unsqueeze(0)
-    timestep = t * 1000
+    timestep = t  # FLUX expects sigma directly in [0, 1]
 
     guidance_vec = torch.tensor([args.guidance], device=device, dtype=torch.bfloat16).expand(B)
 
@@ -461,16 +461,27 @@ def dpo_training_step(transformer, vae, batch, latents_w, latents_l, args, devic
 # ---------------------------------------------------------------------------
 
 def save_lora_checkpoint(transformer, optimizer, step, output_dir):
-    """Save LoRA adapter weights."""
+    """Save LoRA adapter weights using FSDP full state dict gathering."""
+    from torch.distributed.fsdp import (
+        FullyShardedDataParallel as FSDP,
+        StateDictType,
+        FullStateDictConfig,
+    )
+
     save_dir = os.path.join(output_dir, f"checkpoint-{step}")
     os.makedirs(save_dir, exist_ok=True)
-    # Get the base model from FSDP wrapper
-    model = transformer.module if hasattr(transformer, 'module') else transformer
-    # Save only LoRA weights
-    lora_state_dict = {k: v.cpu() for k, v in model.state_dict().items() if "lora" in k.lower()}
-    torch.save(lora_state_dict, os.path.join(save_dir, "lora_weights.pt"))
-    torch.save({"step": step}, os.path.join(save_dir, "training_state.pt"))
-    logger.info(f"Saved checkpoint at step {step} to {save_dir}")
+
+    # Gather full state dict from all FSDP shards onto rank 0 CPU
+    save_policy = FullStateDictConfig(offload_to_cpu=True, rank0_only=True)
+    with FSDP.state_dict_type(transformer, StateDictType.FULL_STATE_DICT, save_policy):
+        state_dict = transformer.state_dict()
+        # Save only LoRA weights
+        lora_state_dict = {k: v for k, v in state_dict.items() if "lora" in k.lower()}
+
+    if dist.get_rank() == 0:
+        torch.save(lora_state_dict, os.path.join(save_dir, "lora_weights.pt"))
+        torch.save({"step": step}, os.path.join(save_dir, "training_state.pt"))
+        logger.info(f"Saved checkpoint at step {step} to {save_dir}")
 
 
 # ---------------------------------------------------------------------------
@@ -495,7 +506,7 @@ def calibrate_compute_tracker(tracker, transformer, vae, hps_model, hps_tokenize
     encoder_hidden_states = torch.zeros(1, 512, 4096, device=device, dtype=torch.bfloat16)
     pooled_prompt_embeds = torch.zeros(1, 768, device=device, dtype=torch.bfloat16)
     text_ids = torch.zeros(1, 512, 3, device=device, dtype=torch.bfloat16)
-    timestep = torch.tensor([500.0], device=device, dtype=torch.bfloat16)
+    timestep = torch.tensor([0.5], device=device, dtype=torch.bfloat16)  # sigma in [0, 1]
     guidance = torch.tensor([3.5], device=device, dtype=torch.bfloat16)
 
     # 1. Calibrate: one FLUX transformer forward pass (sampling)
@@ -613,7 +624,7 @@ def eval_and_log_images(args, transformer, vae, dataset, device, step,
         # Deterministic Euler sampling
         for i in range(args.sampling_steps):
             sigma = sigmas[i]
-            timestep = (sigma * 1000).unsqueeze(0)
+            timestep = sigma.unsqueeze(0)  # FLUX expects sigma in [0, 1]
             with torch.autocast("cuda", torch.bfloat16):
                 pred = transformer(
                     hidden_states=z_packed,
@@ -908,8 +919,8 @@ def main():
 
             # === Checkpointing + eval images ===
             if (global_step + 1) % args.checkpointing_steps == 0:
-                if rank == 0:
-                    save_lora_checkpoint(transformer, optimizer, global_step + 1, args.output_dir)
+                # All ranks must participate in FSDP state dict gathering
+                save_lora_checkpoint(transformer, optimizer, global_step + 1, args.output_dir)
                 # Log eval images at each checkpoint (cfgrl-expo style)
                 eval_and_log_images(args, transformer, vae, dataset, device,
                                     step=global_step + 1, eval_seed=args.seed,
@@ -927,9 +938,8 @@ def main():
 
         epoch += 1
 
-    # Final save + eval
-    if rank == 0:
-        save_lora_checkpoint(transformer, optimizer, global_step, args.output_dir)
+    # Final save + eval (all ranks participate in FSDP state dict gathering)
+    save_lora_checkpoint(transformer, optimizer, global_step, args.output_dir)
 
     eval_and_log_images(args, transformer, vae, dataset, device,
                         step=global_step, eval_seed=args.seed,
