@@ -82,11 +82,24 @@ def prepare_latent_image_ids(batch_size: int, h: int, w: int, device: torch.devi
 # ---------------------------------------------------------------------------
 
 class LatentDataset(Dataset):
-    """Dataset that loads precomputed text embeddings for FLUX RL training."""
+    """Dataset that loads precomputed text embeddings for FLUX RL training.
+
+    Matches DanceGRPO's latent_flux_rl_datasets.py format:
+    - JSON contains bare filenames (e.g. "36044.pt")
+    - Actual .pt files live in subdirectories next to the JSON:
+        <json_dir>/prompt_embed/<filename>.pt
+        <json_dir>/pooled_prompt_embeds/<filename>.pt
+        <json_dir>/text_ids/<filename>.pt
+    """
 
     def __init__(self, data_json_path: str):
         with open(data_json_path, "r") as f:
             self.data = json.load(f)
+        # Base directories derived from JSON location (matches DanceGRPO)
+        base_dir = os.path.dirname(data_json_path)
+        self.prompt_embed_dir = os.path.join(base_dir, "prompt_embed")
+        self.pooled_prompt_embeds_dir = os.path.join(base_dir, "pooled_prompt_embeds")
+        self.text_ids_dir = os.path.join(base_dir, "text_ids")
         logger.info(f"Loaded {len(self.data)} entries from {data_json_path}")
 
     def __len__(self):
@@ -94,14 +107,23 @@ class LatentDataset(Dataset):
 
     def __getitem__(self, idx):
         entry = self.data[idx]
-        prompt_embeds = torch.load(entry["prompt_embed_path"], map_location="cpu", weights_only=True)
-        pooled_prompt_embeds = torch.load(entry["pooled_prompt_embed_path"], map_location="cpu", weights_only=True)
-        text_ids = torch.load(entry["text_id_path"], map_location="cpu", weights_only=True)
+        prompt_embeds = torch.load(
+            os.path.join(self.prompt_embed_dir, entry["prompt_embed_path"]),
+            map_location="cpu", weights_only=True,
+        )
+        pooled_prompt_embeds = torch.load(
+            os.path.join(self.pooled_prompt_embeds_dir, entry["pooled_prompt_embeds_path"]),
+            map_location="cpu", weights_only=True,
+        )
+        text_ids = torch.load(
+            os.path.join(self.text_ids_dir, entry["text_ids"]),
+            map_location="cpu", weights_only=True,
+        )
         return {
             "prompt_embeds": prompt_embeds,
             "pooled_prompt_embeds": pooled_prompt_embeds,
             "text_ids": text_ids,
-            "prompt": entry.get("prompt", ""),
+            "prompt": entry.get("caption", ""),
         }
 
 
