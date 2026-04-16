@@ -119,6 +119,11 @@ class LatentDataset(Dataset):
             os.path.join(self.text_ids_dir, entry["text_ids"]),
             map_location="cpu", weights_only=True,
         )
+        # text_ids is stored as a template (1, 3); expand to match prompt
+        # embedding sequence length (DanceGRPO does text_ids.repeat(seq_len, 1))
+        text_seq_len = prompt_embeds.shape[0]
+        if text_ids.shape[0] < text_seq_len:
+            text_ids = text_ids.expand(text_seq_len, -1).contiguous()
         return {
             "prompt_embeds": prompt_embeds,
             "pooled_prompt_embeds": pooled_prompt_embeds,
