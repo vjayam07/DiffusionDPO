@@ -1,13 +1,25 @@
 #!/bin/bash
+#
+#SBATCH --account=m5319
+#SBATCH --job-name=dpo-flux-finetune
+#SBATCH --constraint=gpu&hbm80g
+#SBATCH --qos=regular
+#SBATCH --time=72:00:00
+#SBATCH --nodes=1                # Single node
+#SBATCH --gpus=a100:4
+#SBATCH --cpus-per-task=16       # CPUs for the job
+#SBATCH --ntasks=4            # Number of tasks (one per GPU)
+#SBATCH --output=/pscratch/sd/v/vjayam/DiffusionDPO/slurm_logs/flux_finetune_%j.out
+#SBATCH --error=/pscratch/sd/v/vjayam/DiffusionDPO/slurm_logs/flux_finetune_%j.err
+#SBATCH --reservation=your_reservation_name
+
 # Launch script for Online DiffusionDPO on FLUX.1-dev with LoRA (4 GPUs)
 # Mirrors DanceGRPO's finetune_flux_grpo_4gpus_lora_a6000.sh
 
-set -euo pipefail
-
 # === Paths (shared with DanceGRPO baseline) ===
-DATA_DIR="${DATA_DIR:-/atlas2/u/vjayam/experiments/cfgrl-expo/DanceGRPO/data}"
-HPS_CKPT_DIR="${HPS_CKPT_DIR:-/atlas2/u/vjayam/experiments/cfgrl-expo/DanceGRPO/hps_ckpt}"
-OUTPUT_DIR="${OUTPUT_DIR:-/atlas2/u/vjayam/experiments/cfgrl-expo/DiffusionDPO/output_dpo_flux}"
+DATA_DIR="${DATA_DIR:-/pscratch/sd/v/vjayam/DiffusionDPO/data}"
+HPS_CKPT_DIR="${HPS_CKPT_DIR:-/pscratch/sd/v/vjayam/DiffusionDPO/hps_ckpt}"
+OUTPUT_DIR="${OUTPUT_DIR:-/pscratch/sd/v/vjayam/DiffusionDPO/output_dpo_flux}"
 
 # === Create output directory ===
 mkdir -p "${OUTPUT_DIR}"
