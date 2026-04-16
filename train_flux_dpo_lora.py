@@ -405,39 +405,13 @@ def dpo_training_step(transformer, vae, batch, latents_w, latents_l, args, devic
 
     guidance_vec = torch.tensor([args.guidance], device=device, dtype=torch.bfloat16).expand(B)
 
-    # --- Policy prediction (LoRA ON) ---
-    peft_model = transformer.module if hasattr(transformer, 'module') else transformer
-    peft_model.enable_adapter_layers()
-
-    # Predict for preferred
     packed_w = pack_latents(noisy_w, args.h, args.w)
-    model_pred_w = transformer(
-        hidden_states=packed_w,
-        timestep=timestep,
-        encoder_hidden_states=prompt_embeds,
-        pooled_projections=pooled_prompt_embeds,
-        txt_ids=text_ids,
-        img_ids=latent_image_ids,
-        guidance=guidance_vec,
-        return_dict=False,
-    )[0]
-    model_pred_w = unpack_latents(model_pred_w, args.h, args.w)
-
-    # Predict for unpreferred
     packed_l = pack_latents(noisy_l, args.h, args.w)
-    model_pred_l = transformer(
-        hidden_states=packed_l,
-        timestep=timestep,
-        encoder_hidden_states=prompt_embeds,
-        pooled_projections=pooled_prompt_embeds,
-        txt_ids=text_ids,
-        img_ids=latent_image_ids,
-        guidance=guidance_vec,
-        return_dict=False,
-    )[0]
-    model_pred_l = unpack_latents(model_pred_l, args.h, args.w)
 
-    # --- Reference prediction (LoRA OFF) ---
+    peft_model = transformer.module if hasattr(transformer, 'module') else transformer
+
+    # --- Reference prediction FIRST (LoRA OFF, no grad) ---
+    # Done first so adapters are never toggled between policy forward and backward.
     peft_model.disable_adapter_layers()
 
     with torch.no_grad():
@@ -465,8 +439,33 @@ def dpo_training_step(transformer, vae, batch, latents_w, latents_l, args, devic
         )[0]
         ref_pred_l = unpack_latents(ref_pred_l, args.h, args.w)
 
-    # Re-enable LoRA for gradient computation
+    # --- Policy prediction (LoRA ON, with grad) ---
+    # Adapters stay ON through forward, loss, and backward (recomputation matches).
     peft_model.enable_adapter_layers()
+
+    model_pred_w = transformer(
+        hidden_states=packed_w,
+        timestep=timestep,
+        encoder_hidden_states=prompt_embeds,
+        pooled_projections=pooled_prompt_embeds,
+        txt_ids=text_ids,
+        img_ids=latent_image_ids,
+        guidance=guidance_vec,
+        return_dict=False,
+    )[0]
+    model_pred_w = unpack_latents(model_pred_w, args.h, args.w)
+
+    model_pred_l = transformer(
+        hidden_states=packed_l,
+        timestep=timestep,
+        encoder_hidden_states=prompt_embeds,
+        pooled_projections=pooled_prompt_embeds,
+        txt_ids=text_ids,
+        img_ids=latent_image_ids,
+        guidance=guidance_vec,
+        return_dict=False,
+    )[0]
+    model_pred_l = unpack_latents(model_pred_l, args.h, args.w)
 
     # --- DPO loss (from DiffusionDPO paper, adapted for flow matching) ---
     # Cast to float32 for stable loss computation (matches original DiffusionDPO)
@@ -783,7 +782,15 @@ def main():
     if args.gradient_checkpointing:
         # Diffusers uses enable_gradient_checkpointing(), not gradient_checkpointing_enable().
         # Reach through PeftModel → LoraModel → FluxTransformer2DModel.
-        transformer.base_model.model.enable_gradient_checkpointing()
+        flux_model = transformer.base_model.model
+        flux_model.enable_gradient_checkpointing()
+        # Force non-reentrant checkpointing to avoid tensor count mismatch
+        # when LoRA adapters are toggled between forward and backward.
+        if hasattr(flux_model, '_gradient_checkpointing_func'):
+            from functools import partial
+            flux_model._gradient_checkpointing_func = partial(
+                torch.utils.checkpoint.checkpoint, use_reentrant=False,
+            )
 
     # --- FSDP ---
     transformer = setup_fsdp(transformer, device, args)
