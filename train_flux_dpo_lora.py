@@ -603,17 +603,72 @@ def calibrate_compute_tracker(tracker, transformer, vae, hps_model, hps_tokenize
 
 
 # ---------------------------------------------------------------------------
+# cfgrl-expo eval prompt loading
+# ---------------------------------------------------------------------------
+
+def load_cfgrl_eval_entries(eval_prompts_dir, cfgrl_eval_seed, max_images):
+    """Load eval prompts and embeddings from cfgrl-expo's PromptEmbeddingStore.
+
+    Replicates cfgrl-expo's eval prompt selection:
+      1. Load 500 eval prompts + embeddings from the store
+      2. Use RandomState(cfgrl_eval_seed) to pick which prompts to visualize
+         (same as cfgrl-expo's _resample_prompt in flux_cfg.py)
+
+    Returns a list of dicts with keys: prompt_embeds, pooled_prompt_embeds,
+    text_ids, prompt — matching LatentDataset's format.
+    """
+    meta = np.load(os.path.join(eval_prompts_dir, "metadata.npz"), allow_pickle=True)
+    eval_prompts = list(meta["eval_prompts"])
+    num_eval_prompts = len(eval_prompts)
+
+    # Embeddings are stored as uint16 (raw bf16 bytes viewed as uint16)
+    pe_raw = np.load(os.path.join(eval_prompts_dir, "eval_prompt_embeds.npy"))
+    pool_raw = np.load(os.path.join(eval_prompts_dir, "eval_pooled_embeds.npy"))
+
+    # uint16 numpy → int16 numpy → torch int16 → view as bf16
+    pe_all = torch.from_numpy(pe_raw.view(np.int16).copy()).view(torch.bfloat16)
+    pool_all = torch.from_numpy(pool_raw.view(np.int16).copy()).view(torch.bfloat16)
+
+    # Replicate cfgrl-expo's eval prompt selection order:
+    # reset_eval_rng() → RandomState(eval_seed), then each reset() calls
+    # _resample_prompt() → randint(0, num_prompts)
+    rng = np.random.RandomState(cfgrl_eval_seed)
+    selected_indices = [int(rng.randint(0, num_eval_prompts)) for _ in range(max_images)]
+
+    entries = []
+    for idx in selected_indices:
+        prompt_embeds = pe_all[idx]         # (seq_len, hidden)
+        pooled = pool_all[idx]              # (768,)
+        seq_len = prompt_embeds.shape[0]
+        # FLUX text_ids are all zeros for text tokens (no spatial position)
+        text_ids = torch.zeros(seq_len, 3, dtype=torch.bfloat16)
+        entries.append({
+            "prompt_embeds": prompt_embeds,
+            "pooled_prompt_embeds": pooled,
+            "text_ids": text_ids,
+            "prompt": eval_prompts[idx],
+        })
+
+    logger.info(f"Loaded {len(entries)} cfgrl-expo eval prompts from {eval_prompts_dir}")
+    return entries
+
+
+# ---------------------------------------------------------------------------
 # Evaluation: generate fixed-seed images and log to wandb
 # ---------------------------------------------------------------------------
 
 @torch.no_grad()
 def eval_and_log_images(args, transformer, vae, dataset, device, step,
-                        eval_seed=42, max_images=9):
+                        eval_seed=42, max_images=9, cfgrl_eval_entries=None):
     """Generate images with fixed prompts/noise and log to wandb.
 
     Mirrors cfgrl-expo's evaluation: same seed resets every eval round so that
     the same prompts and initial latents are used, enabling apples-to-apples
     visual comparison across methods.
+
+    When cfgrl_eval_entries is provided, uses cfgrl-expo's eval prompts instead
+    of the training dataset, so that all three methods (cfgrl-expo, DanceGRPO,
+    DiffusionDPO) evaluate on identical prompts.
 
     All ranks run the transformer forward (required by FSDP), but only rank 0
     decodes and logs images.
@@ -634,7 +689,13 @@ def eval_and_log_images(args, transformer, vae, dataset, device, step,
     sigmas = torch.linspace(1.0, 0.0, args.sampling_steps + 1, device=device)
     sigmas = sd3_time_shift(args.shift, sigmas)
 
-    num_eval = min(max_images, len(dataset))
+    # Choose eval prompt source
+    if cfgrl_eval_entries is not None:
+        eval_entries = cfgrl_eval_entries[:max_images]
+        num_eval = len(eval_entries)
+    else:
+        num_eval = min(max_images, len(dataset))
+        eval_entries = [dataset[idx] for idx in range(num_eval)]
 
     # Phase 1: all ranks run transformer forward (required by FSDP)
     all_z_packed = []
@@ -645,7 +706,7 @@ def eval_and_log_images(args, transformer, vae, dataset, device, step,
     peft_model.enable_adapter_layers()
 
     for idx in range(num_eval):
-        entry = dataset[idx]
+        entry = eval_entries[idx]
         prompt_embeds = entry["prompt_embeds"].unsqueeze(0).to(device, dtype=torch.bfloat16)
         pooled_prompt_embeds = entry["pooled_prompt_embeds"].unsqueeze(0).to(device, dtype=torch.bfloat16)
         # txt_ids must be 2D (seq_len, 3)
@@ -742,6 +803,13 @@ def parse_args():
     parser.add_argument("--eval_every", type=int, default=0,
                         help="Eval and log images every N steps. 0 = only at checkpoints.")
     parser.add_argument("--max_eval_images", type=int, default=9)
+    parser.add_argument("--eval_prompts_dir", type=str, default="",
+                        help="Path to cfgrl-expo's precomputed embedding store "
+                             "(e.g. embeddings/flux_hpdv2/). When set, eval uses "
+                             "the same prompts as cfgrl-expo instead of training data.")
+    parser.add_argument("--cfgrl_eval_seed", type=int, default=0,
+                        help="Eval seed matching cfgrl-expo's eval_seed for "
+                             "deterministic prompt selection (default: 0).")
     return parser.parse_args()
 
 
@@ -821,6 +889,21 @@ def main():
         device, args,
     )
 
+    # --- cfgrl-expo eval prompts (optional) ---
+    cfgrl_eval_entries = None
+    if args.eval_prompts_dir and os.path.isdir(args.eval_prompts_dir):
+        cfgrl_eval_entries = load_cfgrl_eval_entries(
+            args.eval_prompts_dir, args.cfgrl_eval_seed, args.max_eval_images,
+        )
+        if rank == 0:
+            logger.info(f"Using cfgrl-expo eval prompts from {args.eval_prompts_dir}")
+            for i, e in enumerate(cfgrl_eval_entries):
+                logger.info(f"  Eval prompt {i}: {e['prompt'][:80]}...")
+    elif args.eval_prompts_dir:
+        if rank == 0:
+            logger.warning(f"--eval_prompts_dir={args.eval_prompts_dir} not found, "
+                           "falling back to training dataset for eval.")
+
     # --- Training ---
     global_step = 0
     optimizer.zero_grad()
@@ -839,7 +922,8 @@ def main():
     if rank == 0:
         logger.info("Generating baseline evaluation images (step 0)...")
     eval_and_log_images(args, transformer, vae, dataset, device,
-                        step=0, eval_seed=args.seed, max_images=args.max_eval_images)
+                        step=0, eval_seed=args.seed, max_images=args.max_eval_images,
+                        cfgrl_eval_entries=cfgrl_eval_entries)
 
     step_times = []
     epoch = 0
@@ -970,14 +1054,16 @@ def main():
                 # Log eval images at each checkpoint (cfgrl-expo style)
                 eval_and_log_images(args, transformer, vae, dataset, device,
                                     step=global_step + 1, eval_seed=args.seed,
-                                    max_images=args.max_eval_images)
+                                    max_images=args.max_eval_images,
+                                    cfgrl_eval_entries=cfgrl_eval_entries)
                 dist.barrier()
 
             # === Optional periodic eval ===
             elif args.eval_every > 0 and (global_step + 1) % args.eval_every == 0:
                 eval_and_log_images(args, transformer, vae, dataset, device,
                                     step=global_step + 1, eval_seed=args.seed,
-                                    max_images=args.max_eval_images)
+                                    max_images=args.max_eval_images,
+                                    cfgrl_eval_entries=cfgrl_eval_entries)
                 dist.barrier()
 
             global_step += 1
@@ -989,7 +1075,8 @@ def main():
 
     eval_and_log_images(args, transformer, vae, dataset, device,
                         step=global_step, eval_seed=args.seed,
-                        max_images=args.max_eval_images)
+                        max_images=args.max_eval_images,
+                        cfgrl_eval_entries=cfgrl_eval_entries)
 
     # Print and save compute summary
     if rank == 0:
