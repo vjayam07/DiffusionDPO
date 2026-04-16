@@ -1,0 +1,26 @@
+# Requirements for FLUX DPO LoRA training
+# Use with: conda create -n dpo-flux python=3.10 && conda activate dpo-flux
+# Then:     pip install torch==2.5.0 torchvision --index-url https://download.pytorch.org/whl/cu121
+# Then:     pip install -r requirements_flux.txt
+
+# Core
+diffusers>=0.32.0
+transformers>=4.40.0
+accelerate>=0.30.0
+peft>=0.10.0
+
+# Training
+torch>=2.5.0
+torchvision
+
+# Reward model
+hpsv2
+
+# Logging
+wandb
+
+# Utilities
+numpy
+Pillow
+datasets
+ftfy
