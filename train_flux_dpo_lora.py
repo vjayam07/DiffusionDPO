@@ -13,7 +13,6 @@ Usage:
 import argparse
 import json
 import logging
-import math
 import os
 import random
 import time
@@ -35,9 +34,9 @@ logger = logging.getLogger(__name__)
 # FLUX helpers (flow-matching utilities)
 # ---------------------------------------------------------------------------
 
-def sd3_time_shift(mu: float, sigma: float, t: torch.Tensor) -> torch.Tensor:
-    """Shift the time schedule for SD3/FLUX (from SD3 paper)."""
-    return math.exp(mu) / (math.exp(mu) + (1 / t - 1) ** sigma)
+def sd3_time_shift(shift: float, t: torch.Tensor) -> torch.Tensor:
+    """Shift the time schedule for SD3/FLUX (matches DanceGRPO/diffusers)."""
+    return (shift * t) / (1 + (shift - 1) * t)
 
 
 def pack_latents(latents: torch.Tensor, h: int, w: int) -> torch.Tensor:
@@ -308,7 +307,7 @@ def generate_latents(transformer, scheduler, batch, args, device):
     # Setup timesteps
     sigmas = torch.linspace(1.0, 0.0, args.sampling_steps + 1, device=device)
     # Apply shift
-    sigmas = sd3_time_shift(args.shift, 1.0, sigmas)
+    sigmas = sd3_time_shift(args.shift, sigmas)
 
     # Ensure LoRA is ON during generation (we generate from current policy)
     # PeftModel methods: enable_adapter_layers / disable_adapter_layers
@@ -383,7 +382,7 @@ def dpo_training_step(transformer, vae, batch, latents_w, latents_l, args, devic
 
     # Sample random sigma (timestep) for each item in batch
     sigma = torch.rand(B, device=device, dtype=torch.bfloat16)
-    sigma = sd3_time_shift(args.shift, 1.0, sigma)
+    sigma = sd3_time_shift(args.shift, sigma)
     sigma = sigma[:, None, None, None]  # (B, 1, 1, 1)
 
     # Sample shared noise
@@ -633,7 +632,7 @@ def eval_and_log_images(args, transformer, vae, dataset, device, step,
 
     # Sigma schedule (same as training)
     sigmas = torch.linspace(1.0, 0.0, args.sampling_steps + 1, device=device)
-    sigmas = sd3_time_shift(args.shift, 1.0, sigmas)
+    sigmas = sd3_time_shift(args.shift, sigmas)
 
     num_eval = min(max_images, len(dataset))
 
