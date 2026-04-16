@@ -293,11 +293,11 @@ def generate_latents(transformer, scheduler, batch, args, device):
     # Repeat prompt embeddings K times
     prompt_embeds = batch["prompt_embeds"].to(device, dtype=torch.bfloat16)
     pooled_prompt_embeds = batch["pooled_prompt_embeds"].to(device, dtype=torch.bfloat16)
-    text_ids = batch["text_ids"].to(device, dtype=torch.bfloat16)
+    # txt_ids must be 2D (seq_len, 3) — FLUX broadcasts across the batch
+    text_ids = batch["text_ids"][0].to(device, dtype=torch.bfloat16)
 
     prompt_embeds = prompt_embeds.repeat_interleave(K, dim=0)
     pooled_prompt_embeds = pooled_prompt_embeds.repeat_interleave(K, dim=0)
-    text_ids = text_ids.repeat_interleave(K, dim=0)
 
     BK = B * K
     latent_image_ids = prepare_latent_image_ids(lh, lw, device, torch.bfloat16)
@@ -377,7 +377,8 @@ def dpo_training_step(transformer, vae, batch, latents_w, latents_l, args, devic
 
     prompt_embeds = batch["prompt_embeds"].to(device, dtype=torch.bfloat16)
     pooled_prompt_embeds = batch["pooled_prompt_embeds"].to(device, dtype=torch.bfloat16)
-    text_ids = batch["text_ids"].to(device, dtype=torch.bfloat16)
+    # txt_ids must be 2D (seq_len, 3)
+    text_ids = batch["text_ids"][0].to(device, dtype=torch.bfloat16)
     latent_image_ids = prepare_latent_image_ids(lh, lw, device, torch.bfloat16)
 
     # Sample random sigma (timestep) for each item in batch
@@ -543,7 +544,7 @@ def calibrate_compute_tracker(tracker, transformer, vae, hps_model, hps_tokenize
     image_ids = prepare_latent_image_ids(lh, lw, device, torch.bfloat16)
     encoder_hidden_states = torch.zeros(1, 512, 4096, device=device, dtype=torch.bfloat16)
     pooled_prompt_embeds = torch.zeros(1, 768, device=device, dtype=torch.bfloat16)
-    text_ids = torch.zeros(1, 512, 3, device=device, dtype=torch.bfloat16)
+    text_ids = torch.zeros(512, 3, device=device, dtype=torch.bfloat16)  # 2D (seq_len, 3)
     timestep = torch.tensor([0.5], device=device, dtype=torch.bfloat16)  # sigma in [0, 1]
     guidance = torch.tensor([3.5], device=device, dtype=torch.bfloat16)
 
@@ -649,7 +650,8 @@ def eval_and_log_images(args, transformer, vae, dataset, device, step,
         entry = dataset[idx]
         prompt_embeds = entry["prompt_embeds"].unsqueeze(0).to(device, dtype=torch.bfloat16)
         pooled_prompt_embeds = entry["pooled_prompt_embeds"].unsqueeze(0).to(device, dtype=torch.bfloat16)
-        text_ids = entry["text_ids"].unsqueeze(0).to(device, dtype=torch.bfloat16)
+        # txt_ids must be 2D (seq_len, 3)
+        text_ids = entry["text_ids"].to(device, dtype=torch.bfloat16)
         caption = entry["prompt"]
 
         z = torch.randn(1, C, lh, lw, device=device, dtype=torch.bfloat16,
