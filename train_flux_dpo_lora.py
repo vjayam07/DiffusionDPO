@@ -226,10 +226,7 @@ def setup_fsdp(transformer, device, args):
     import functools
 
     # Wrap policy: wrap each transformer block
-    def _policy_fn(module, recurse, **kwargs):
-        if recurse:
-            return True
-        # Wrap individual transformer blocks
+    def _policy_fn(module):
         cls_name = module.__class__.__name__
         return "TransformerBlock" in cls_name or "SingleTransformerBlock" in cls_name
 
