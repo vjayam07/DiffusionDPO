@@ -763,7 +763,9 @@ def main():
     transformer, vae, scheduler = load_flux_models(args, device)
 
     if args.gradient_checkpointing:
-        transformer.gradient_checkpointing_enable()
+        # Diffusers uses enable_gradient_checkpointing(), not gradient_checkpointing_enable().
+        # Reach through PeftModel → LoraModel → FluxTransformer2DModel.
+        transformer.base_model.model.enable_gradient_checkpointing()
 
     # --- FSDP ---
     transformer = setup_fsdp(transformer, device, args)
