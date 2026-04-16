@@ -184,12 +184,23 @@ def load_flux_models(args, device):
     vae.requires_grad_(False)
 
     # Apply LoRA to transformer
+    # Workaround: PEFT's cast_adapter_dtype enumerates float8 dtypes
+    # (e.g. float8_e8m0fnu) that don't exist in PyTorch 2.5. Patch it
+    # to silently skip missing dtypes.
+    import peft.tuners.tuners_utils as _peft_tuners
+    _orig_cast = _peft_tuners.cast_adapter_dtype
+    def _safe_cast(*args, **kwargs):
+        try:
+            return _orig_cast(*args, **kwargs)
+        except AttributeError:
+            pass
+    _peft_tuners.cast_adapter_dtype = _safe_cast
+
     lora_config = LoraConfig(
         r=args.lora_rank,
         lora_alpha=args.lora_alpha,
         target_modules=["to_k", "to_q", "to_v", "to_out.0"],
         lora_dropout=0.0,
-        autocast_adapter_dtype=False,  # Avoid PEFT enumerating float8 dtypes missing in PyTorch 2.5
     )
     transformer = get_peft_model(transformer, lora_config)
     transformer.print_trainable_parameters()
