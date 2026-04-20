@@ -20,7 +20,6 @@
 DATA_DIR="${DATA_DIR:-/pscratch/sd/v/vjayam/DiffusionDPO/data}"
 HPS_CKPT_DIR="${HPS_CKPT_DIR:-/pscratch/sd/v/vjayam/DiffusionDPO/hps_ckpt}"
 OUTPUT_DIR="${OUTPUT_DIR:-/pscratch/sd/v/vjayam/DiffusionDPO/output_dpo_flux}"
-EVAL_PROMPTS_DIR="${EVAL_PROMPTS_DIR:-/pscratch/sd/v/vjayam/DiffusionDPO/embeddings/flux_hpdv2}"
 
 # === Create output directory ===
 mkdir -p "${OUTPUT_DIR}"
@@ -31,7 +30,6 @@ echo "============================================="
 echo "FLUX weights:  ${DATA_DIR}/flux"
 echo "Embeddings:    ${DATA_DIR}/rl_embeddings/videos2caption.json"
 echo "HPSv2 ckpt:    ${HPS_CKPT_DIR}"
-echo "Eval prompts:  ${EVAL_PROMPTS_DIR}"
 echo "Output:        ${OUTPUT_DIR}"
 echo "============================================="
 
@@ -41,7 +39,7 @@ torchrun --nproc_per_node=4 --master_port 19003 \
   --pretrained_model_name_or_path "${DATA_DIR}/flux" \
   --data_json_path "${DATA_DIR}/rl_embeddings/videos2caption.json" \
   --h 512 --w 512 \
-  --sampling_steps 8 \
+  --sampling_steps 4 \
   --shift 3.0 \
   --guidance 3.5 \
   --lora_rank 128 \
@@ -61,7 +59,6 @@ torchrun --nproc_per_node=4 --master_port 19003 \
   --max_grad_norm 1.0 \
   --wandb_project "flux-dpo" \
   --max_eval_images 9 \
-  --eval_prompts_dir "${EVAL_PROMPTS_DIR}" \
-  --cfgrl_eval_seed 0 \
+  --num_eval_prompts 250 \
   --output_dir "${OUTPUT_DIR}" \
   2>&1 | tee "${OUTPUT_DIR}/train.log"

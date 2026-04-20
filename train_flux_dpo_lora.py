@@ -603,54 +603,130 @@ def calibrate_compute_tracker(tracker, transformer, vae, hps_model, hps_tokenize
 
 
 # ---------------------------------------------------------------------------
-# cfgrl-expo eval prompt loading
+# Evaluation: quantitative HPSv2 reward on fixed eval prompts
 # ---------------------------------------------------------------------------
 
-def load_cfgrl_eval_entries(eval_prompts_dir, cfgrl_eval_seed, max_images):
-    """Load eval prompts and embeddings from cfgrl-expo's PromptEmbeddingStore.
+@torch.no_grad()
+def eval_hpsv2_reward(args, transformer, vae, dataset, eval_indices,
+                      hps_model, hps_preprocess, hps_tokenizer,
+                      device, step, eval_seed=42):
+    """Quantitative eval: generate 1 image per prompt, score with HPSv2.
 
-    Replicates cfgrl-expo's eval prompt selection:
-      1. Load 500 eval prompts + embeddings from the store
-      2. Use RandomState(cfgrl_eval_seed) to pick which prompts to visualize
-         (same as cfgrl-expo's _resample_prompt in flux_cfg.py)
+    Generates images for all prompts in eval_indices (fixed across evals),
+    scores them, and logs aggregate HPSv2 statistics to wandb.
 
-    Returns a list of dicts with keys: prompt_embeds, pooled_prompt_embeds,
-    text_ids, prompt — matching LatentDataset's format.
+    All ranks run transformer forward (FSDP requirement).
+    Only rank 0 decodes and scores.
     """
-    meta = np.load(os.path.join(eval_prompts_dir, "metadata.npz"), allow_pickle=True)
-    eval_prompts = list(meta["eval_prompts"])
-    num_eval_prompts = len(eval_prompts)
+    from diffusers.image_processor import VaeImageProcessor
 
-    # Embeddings are stored as uint16 (raw bf16 bytes viewed as uint16)
-    pe_raw = np.load(os.path.join(eval_prompts_dir, "eval_prompt_embeds.npy"))
-    pool_raw = np.load(os.path.join(eval_prompts_dir, "eval_pooled_embeds.npy"))
+    rank = dist.get_rank()
+    transformer.eval()
 
-    # uint16 numpy → int16 numpy → torch int16 → view as bf16
-    pe_all = torch.from_numpy(pe_raw.view(np.int16).copy()).view(torch.bfloat16)
-    pool_all = torch.from_numpy(pool_raw.view(np.int16).copy()).view(torch.bfloat16)
+    lh = args.h // 8
+    lw = args.w // 8
+    C = 16
 
-    # Replicate cfgrl-expo's eval prompt selection order:
-    # reset_eval_rng() → RandomState(eval_seed), then each reset() calls
-    # _resample_prompt() → randint(0, num_prompts)
-    rng = np.random.RandomState(cfgrl_eval_seed)
-    selected_indices = [int(rng.randint(0, num_eval_prompts)) for _ in range(max_images)]
+    # Reset noise generator every eval — same noise for same prompts across evals
+    generator = torch.Generator(device=device).manual_seed(eval_seed)
 
-    entries = []
-    for idx in selected_indices:
-        prompt_embeds = pe_all[idx]         # (seq_len, hidden)
-        pooled = pool_all[idx]              # (768,)
-        seq_len = prompt_embeds.shape[0]
-        # FLUX text_ids are all zeros for text tokens (no spatial position)
-        text_ids = torch.zeros(seq_len, 3, dtype=torch.bfloat16)
-        entries.append({
-            "prompt_embeds": prompt_embeds,
-            "pooled_prompt_embeds": pooled,
-            "text_ids": text_ids,
-            "prompt": eval_prompts[idx],
-        })
+    # Sigma schedule
+    sigmas = torch.linspace(1.0, 0.0, args.sampling_steps + 1, device=device)
+    sigmas = sd3_time_shift(args.shift, sigmas)
 
-    logger.info(f"Loaded {len(entries)} cfgrl-expo eval prompts from {eval_prompts_dir}")
-    return entries
+    # Ensure LoRA is ON (generate from current policy)
+    peft_model = transformer.module if hasattr(transformer, 'module') else transformer
+    peft_model.enable_adapter_layers()
+
+    num_eval = len(eval_indices)
+    all_z_packed = []
+    all_captions = []
+
+    for eval_idx in eval_indices:
+        entry = dataset[eval_idx]
+        prompt_embeds = entry["prompt_embeds"].unsqueeze(0).to(device, dtype=torch.bfloat16)
+        pooled_prompt_embeds = entry["pooled_prompt_embeds"].unsqueeze(0).to(device, dtype=torch.bfloat16)
+        text_ids = entry["text_ids"].to(device, dtype=torch.bfloat16)
+        caption = entry["prompt"]
+
+        z = torch.randn(1, C, lh, lw, device=device, dtype=torch.bfloat16,
+                        generator=generator)
+        z_packed = pack_latents(z, args.h, args.w)
+        image_ids = prepare_latent_image_ids(lh, lw, device, torch.bfloat16)
+
+        # Euler sampling
+        for i in range(args.sampling_steps):
+            sigma = sigmas[i]
+            timestep = sigma.unsqueeze(0)
+            with torch.autocast("cuda", torch.bfloat16):
+                pred = transformer(
+                    hidden_states=z_packed,
+                    timestep=timestep,
+                    encoder_hidden_states=prompt_embeds,
+                    pooled_projections=pooled_prompt_embeds,
+                    txt_ids=text_ids,
+                    img_ids=image_ids,
+                    guidance=torch.tensor([args.guidance], device=device,
+                                          dtype=torch.bfloat16),
+                    return_dict=False,
+                )[0]
+            dsigma = sigmas[i + 1] - sigmas[i]
+            z_packed = z_packed + dsigma * pred
+
+        all_z_packed.append(z_packed)
+        all_captions.append(caption)
+
+    # Phase 2: rank 0 decodes and scores
+    mean_reward = 0.0
+    if rank == 0:
+        vae.enable_tiling()
+        image_processor = VaeImageProcessor(vae_scale_factor=16)
+        scores = []
+        wandb_images = []
+        images_dir = os.path.join(args.output_dir, "eval_images", f"step_{step}")
+        os.makedirs(images_dir, exist_ok=True)
+
+        for img_idx, (z_packed, caption) in enumerate(zip(all_z_packed, all_captions)):
+            with torch.autocast("cuda", dtype=torch.bfloat16):
+                latents = unpack_latents(z_packed, args.h, args.w)
+                latents = (latents / 0.3611) + 0.1159
+                image = vae.decode(latents, return_dict=False)[0]
+                decoded = image_processor.postprocess(image)
+
+            pil_img = decoded[0]
+
+            # Score with HPSv2
+            img_score = score_images(
+                hps_model, hps_preprocess, hps_tokenizer,
+                [pil_img], [caption], device,
+            )[0]
+            scores.append(img_score)
+
+            # Save first 9 images for visual inspection
+            if img_idx < 9:
+                img_path = os.path.join(images_dir, f"eval_{img_idx}.png")
+                pil_img.save(img_path)
+                wandb_images.append(wandb.Image(pil_img, caption=f"{caption[:80]}  [{img_score:.4f}]"))
+
+        scores_arr = np.array(scores)
+        mean_reward = float(scores_arr.mean())
+        log_dict = {
+            "eval/mean_hpsv2": mean_reward,
+            "eval/std_hpsv2": float(scores_arr.std()),
+            "eval/min_hpsv2": float(scores_arr.min()),
+            "eval/max_hpsv2": float(scores_arr.max()),
+        }
+        if wandb_images:
+            log_dict["evaluation/samples"] = wandb_images
+        wandb.log(log_dict, step=step)
+        logger.info(f"[Eval step {step}] HPSv2: mean={mean_reward:.4f}, "
+                    f"std={scores_arr.std():.4f}, "
+                    f"min={scores_arr.min():.4f}, max={scores_arr.max():.4f} "
+                    f"(n={num_eval})")
+
+    transformer.train()
+    dist.barrier()
+    return mean_reward
 
 
 # ---------------------------------------------------------------------------
@@ -659,16 +735,12 @@ def load_cfgrl_eval_entries(eval_prompts_dir, cfgrl_eval_seed, max_images):
 
 @torch.no_grad()
 def eval_and_log_images(args, transformer, vae, dataset, device, step,
-                        eval_seed=42, max_images=9, cfgrl_eval_entries=None):
+                        eval_seed=42, max_images=9):
     """Generate images with fixed prompts/noise and log to wandb.
 
     Mirrors cfgrl-expo's evaluation: same seed resets every eval round so that
     the same prompts and initial latents are used, enabling apples-to-apples
     visual comparison across methods.
-
-    When cfgrl_eval_entries is provided, uses cfgrl-expo's eval prompts instead
-    of the training dataset, so that all three methods (cfgrl-expo, DanceGRPO,
-    DiffusionDPO) evaluate on identical prompts.
 
     All ranks run the transformer forward (required by FSDP), but only rank 0
     decodes and logs images.
@@ -689,13 +761,7 @@ def eval_and_log_images(args, transformer, vae, dataset, device, step,
     sigmas = torch.linspace(1.0, 0.0, args.sampling_steps + 1, device=device)
     sigmas = sd3_time_shift(args.shift, sigmas)
 
-    # Choose eval prompt source
-    if cfgrl_eval_entries is not None:
-        eval_entries = cfgrl_eval_entries[:max_images]
-        num_eval = len(eval_entries)
-    else:
-        num_eval = min(max_images, len(dataset))
-        eval_entries = [dataset[idx] for idx in range(num_eval)]
+    num_eval = min(max_images, len(dataset))
 
     # Phase 1: all ranks run transformer forward (required by FSDP)
     all_z_packed = []
@@ -706,7 +772,7 @@ def eval_and_log_images(args, transformer, vae, dataset, device, step,
     peft_model.enable_adapter_layers()
 
     for idx in range(num_eval):
-        entry = eval_entries[idx]
+        entry = dataset[idx]
         prompt_embeds = entry["prompt_embeds"].unsqueeze(0).to(device, dtype=torch.bfloat16)
         pooled_prompt_embeds = entry["pooled_prompt_embeds"].unsqueeze(0).to(device, dtype=torch.bfloat16)
         # txt_ids must be 2D (seq_len, 3)
@@ -803,14 +869,16 @@ def parse_args():
     parser.add_argument("--eval_every", type=int, default=0,
                         help="Eval and log images every N steps. 0 = only at checkpoints.")
     parser.add_argument("--max_eval_images", type=int, default=9)
-    parser.add_argument("--eval_prompts_dir", type=str, default="",
-                        help="Path to cfgrl-expo's precomputed embedding store "
-                             "(e.g. embeddings/flux_hpdv2/). When set, eval uses "
-                             "the same prompts as cfgrl-expo instead of training data.")
-    parser.add_argument("--cfgrl_eval_seed", type=int, default=0,
-                        help="Eval seed matching cfgrl-expo's eval_seed for "
-                             "deterministic prompt selection (default: 0).")
+    parser.add_argument("--num_eval_prompts", type=int, default=250,
+                        help="Number of fixed random prompts for quantitative HPSv2 eval.")
     return parser.parse_args()
+
+
+def should_checkpoint(step):
+    """Variable checkpoint/eval schedule: every 10 for first 200, every 50 after."""
+    if step <= 200:
+        return step % 10 == 0
+    return step % 50 == 0
 
 
 def main():
@@ -889,20 +957,10 @@ def main():
         device, args,
     )
 
-    # --- cfgrl-expo eval prompts (optional) ---
-    cfgrl_eval_entries = None
-    if args.eval_prompts_dir and os.path.isdir(args.eval_prompts_dir):
-        cfgrl_eval_entries = load_cfgrl_eval_entries(
-            args.eval_prompts_dir, args.cfgrl_eval_seed, args.max_eval_images,
-        )
-        if rank == 0:
-            logger.info(f"Using cfgrl-expo eval prompts from {args.eval_prompts_dir}")
-            for i, e in enumerate(cfgrl_eval_entries):
-                logger.info(f"  Eval prompt {i}: {e['prompt'][:80]}...")
-    elif args.eval_prompts_dir:
-        if rank == 0:
-            logger.warning(f"--eval_prompts_dir={args.eval_prompts_dir} not found, "
-                           "falling back to training dataset for eval.")
+    # --- Fixed eval prompt indices (same 250 prompts every eval) ---
+    eval_rng = np.random.RandomState(args.seed + 1000)
+    n_eval = min(args.num_eval_prompts, len(dataset))
+    eval_indices = eval_rng.choice(len(dataset), size=n_eval, replace=False).tolist()
 
     # --- Training ---
     global_step = 0
@@ -917,13 +975,15 @@ def main():
         logger.info(f"  Effective batch size = {args.train_batch_size * world_size * args.gradient_accumulation_steps}")
         logger.info(f"  Num generations per prompt = {args.num_generations}")
         logger.info(f"  Max train steps = {args.max_train_steps}")
+        logger.info(f"  Num eval prompts = {n_eval}")
+        logger.info(f"  Eval schedule: every 10 steps (first 200), every 50 after")
 
-    # --- Eval baseline images before training (step 0) ---
+    # --- Eval baseline before training (step 0) ---
     if rank == 0:
-        logger.info("Generating baseline evaluation images (step 0)...")
-    eval_and_log_images(args, transformer, vae, dataset, device,
-                        step=0, eval_seed=args.seed, max_images=args.max_eval_images,
-                        cfgrl_eval_entries=cfgrl_eval_entries)
+        logger.info("Running baseline HPSv2 evaluation (step 0)...")
+    eval_hpsv2_reward(args, transformer, vae, dataset, eval_indices,
+                      hps_model, hps_preprocess, hps_tokenizer,
+                      device, step=0, eval_seed=args.seed)
 
     step_times = []
     epoch = 0
@@ -1047,23 +1107,14 @@ def main():
                     f.write(f"{global_step}\t{mean_reward:.6f}\t{metrics['dpo_loss']:.6f}\t"
                             f"{metrics['implicit_acc']:.4f}\n")
 
-            # === Checkpointing + eval images ===
-            if (global_step + 1) % args.checkpointing_steps == 0:
+            # === Checkpointing + HPSv2 eval (variable schedule) ===
+            if should_checkpoint(global_step + 1):
                 # All ranks must participate in FSDP state dict gathering
                 save_lora_checkpoint(transformer, optimizer, global_step + 1, args.output_dir)
-                # Log eval images at each checkpoint (cfgrl-expo style)
-                eval_and_log_images(args, transformer, vae, dataset, device,
-                                    step=global_step + 1, eval_seed=args.seed,
-                                    max_images=args.max_eval_images,
-                                    cfgrl_eval_entries=cfgrl_eval_entries)
-                dist.barrier()
-
-            # === Optional periodic eval ===
-            elif args.eval_every > 0 and (global_step + 1) % args.eval_every == 0:
-                eval_and_log_images(args, transformer, vae, dataset, device,
-                                    step=global_step + 1, eval_seed=args.seed,
-                                    max_images=args.max_eval_images,
-                                    cfgrl_eval_entries=cfgrl_eval_entries)
+                # Quantitative HPSv2 eval on fixed 250 prompts
+                eval_hpsv2_reward(args, transformer, vae, dataset, eval_indices,
+                                  hps_model, hps_preprocess, hps_tokenizer,
+                                  device, step=global_step + 1, eval_seed=args.seed)
                 dist.barrier()
 
             global_step += 1
@@ -1073,10 +1124,9 @@ def main():
     # Final save + eval (all ranks participate in FSDP state dict gathering)
     save_lora_checkpoint(transformer, optimizer, global_step, args.output_dir)
 
-    eval_and_log_images(args, transformer, vae, dataset, device,
-                        step=global_step, eval_seed=args.seed,
-                        max_images=args.max_eval_images,
-                        cfgrl_eval_entries=cfgrl_eval_entries)
+    eval_hpsv2_reward(args, transformer, vae, dataset, eval_indices,
+                      hps_model, hps_preprocess, hps_tokenizer,
+                      device, step=global_step, eval_seed=args.seed)
 
     # Print and save compute summary
     if rank == 0:
