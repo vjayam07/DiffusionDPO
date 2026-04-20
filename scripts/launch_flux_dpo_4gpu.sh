@@ -11,7 +11,7 @@
 #SBATCH --ntasks=4            # Number of tasks (one per GPU)
 #SBATCH --output=/pscratch/sd/v/vjayam/DiffusionDPO/slurm_logs/flux_finetune_%j.out
 #SBATCH --error=/pscratch/sd/v/vjayam/DiffusionDPO/slurm_logs/flux_finetune_%j.err
-#SBATCH --reservation=cfgrl_expo
+#SBATCH --reservation=baselines_cfgrl_expo
 
 # Launch script for Online DiffusionDPO on FLUX.1-dev with LoRA (4 GPUs)
 # Mirrors DanceGRPO's finetune_flux_grpo_4gpus_lora_a6000.sh
