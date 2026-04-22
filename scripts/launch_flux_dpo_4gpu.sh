@@ -49,7 +49,7 @@ torchrun --nproc_per_node=4 --master_port 19003 \
   --train_batch_size 1 \
   --gradient_accumulation_steps 12 \
   --learning_rate 3e-4 \
-  --max_train_steps 1000 \
+  --max_train_steps 4500 \
   --gradient_checkpointing \
   --mixed_precision bf16 \
   --hps_ckpt_dir "${HPS_CKPT_DIR}" \
