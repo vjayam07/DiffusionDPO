@@ -19,7 +19,7 @@
 # === Paths (shared with DanceGRPO baseline) ===
 DATA_DIR="${DATA_DIR:-/pscratch/sd/v/vjayam/DiffusionDPO/data}"
 HPS_CKPT_DIR="${HPS_CKPT_DIR:-/pscratch/sd/v/vjayam/DiffusionDPO/hps_ckpt}"
-OUTPUT_DIR="${OUTPUT_DIR:-/pscratch/sd/v/vjayam/DiffusionDPO/output_dpo_flux}"
+OUTPUT_DIR="${OUTPUT_DIR:-/pscratch/sd/v/vjayam/DiffusionDPO/output_dpo_flux_8step}"
 
 # === Create output directory ===
 mkdir -p "${OUTPUT_DIR}"
@@ -39,7 +39,7 @@ torchrun --nproc_per_node=4 --master_port 19003 \
   --pretrained_model_name_or_path "${DATA_DIR}/flux" \
   --data_json_path "${DATA_DIR}/rl_embeddings/videos2caption.json" \
   --h 512 --w 512 \
-  --sampling_steps 4 \
+  --sampling_steps 8 \
   --shift 3.0 \
   --guidance 3.5 \
   --lora_rank 128 \
