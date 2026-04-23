@@ -228,6 +228,13 @@ def load_flux_models(args, device):
         lora_dropout=0.0,
     )
     transformer = get_peft_model(transformer, lora_config)
+    # Cast LoRA parameters to bfloat16 to match base model.
+    # The _safe_cast workaround above may prevent PEFT's automatic
+    # dtype casting, leaving LoRA weights in float32. FSDP requires
+    # uniform dtype across all parameters within a wrapped module.
+    for param in transformer.parameters():
+        if param.requires_grad:
+            param.data = param.data.to(torch.bfloat16)
     transformer.print_trainable_parameters()
 
     vae = vae.to(device)
