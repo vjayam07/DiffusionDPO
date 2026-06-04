@@ -678,10 +678,16 @@ def eval_hpsv2_reward(args, transformer, vae, dataset, eval_indices,
     sigmas = sd3_time_shift(args.shift, sigmas)
 
     num_eval = len(eval_indices)
-    all_z_packed = []
-    all_captions = []
+    scores = []
+    wandb_images = []
+    images_dir = os.path.join(args.output_dir, "eval_images", f"step_{step}")
+    image_processor = None
+    if rank == 0:
+        vae.enable_tiling()
+        image_processor = VaeImageProcessor(vae_scale_factor=16)
+        os.makedirs(images_dir, exist_ok=True)
 
-    for eval_idx in eval_indices:
+    for img_idx, eval_idx in enumerate(eval_indices):
         entry = dataset[eval_idx]
         prompt_embeds = entry["prompt_embeds"].unsqueeze(0).to(device, dtype=torch.bfloat16)
         pooled_prompt_embeds = entry["pooled_prompt_embeds"].unsqueeze(0).to(device, dtype=torch.bfloat16)
@@ -712,20 +718,7 @@ def eval_hpsv2_reward(args, transformer, vae, dataset, eval_indices,
             dsigma = sigmas[i + 1] - sigmas[i]
             z_packed = z_packed + dsigma * pred
 
-        all_z_packed.append(z_packed)
-        all_captions.append(caption)
-
-    # Phase 2: rank 0 decodes and scores
-    mean_reward = 0.0
-    if rank == 0:
-        vae.enable_tiling()
-        image_processor = VaeImageProcessor(vae_scale_factor=16)
-        scores = []
-        wandb_images = []
-        images_dir = os.path.join(args.output_dir, "eval_images", f"step_{step}")
-        os.makedirs(images_dir, exist_ok=True)
-
-        for img_idx, (z_packed, caption) in enumerate(zip(all_z_packed, all_captions)):
+        if rank == 0:
             with torch.autocast("cuda", dtype=torch.bfloat16):
                 latents = unpack_latents(z_packed, args.h, args.w)
                 latents = (latents / 0.3611) + 0.1159
@@ -745,6 +738,11 @@ def eval_hpsv2_reward(args, transformer, vae, dataset, eval_indices,
             pil_img.save(img_path)
             wandb_images.append(wandb.Image(pil_img, caption=f"{caption[:80]}  [{img_score:.4f}]"))
 
+        del z_packed
+
+    # Phase 2: rank 0 logs scores and images
+    mean_reward = 0.0
+    if rank == 0:
         scores_arr = np.array(scores)
         mean_reward = float(scores_arr.mean())
         log_dict = {
@@ -762,6 +760,7 @@ def eval_hpsv2_reward(args, transformer, vae, dataset, eval_indices,
                     f"(n={num_eval})")
 
     transformer.train()
+    torch.cuda.empty_cache()
     dist.barrier()
     return mean_reward
 
@@ -870,6 +869,7 @@ def eval_and_log_images(args, transformer, vae, dataset, device, step,
         logger.info(f"Eval images logged to wandb and saved to {images_dir}")
 
     transformer.train()
+    torch.cuda.empty_cache()
     dist.barrier()
 
 
@@ -1109,6 +1109,7 @@ def main():
 
                 latents_w = torch.stack(latents_w_list)  # (B, C, lh, lw)
                 latents_l = torch.stack(latents_l_list)  # (B, C, lh, lw)
+                del latents_all, pil_images, latents_w_list, latents_l_list
 
             # === PHASE 2: DPO training step ===
             transformer.train()
