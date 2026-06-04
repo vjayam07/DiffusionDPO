@@ -38,7 +38,7 @@ torchrun --nproc_per_node=4 --master_port 19003 \
   --pretrained_model_name_or_path "${DATA_DIR}/flux" \
   --data_json_path "${DATA_DIR}/rl_embeddings/videos2caption.json" \
   --h 512 --w 512 \
-  --sampling_steps 8 \
+  --sampling_steps 4 \
   --shift 3.0 \
   --guidance 3.5 \
   --beta_dpo 5000 \
@@ -55,7 +55,10 @@ torchrun --nproc_per_node=4 --master_port 19003 \
   --log_every 1 \
   --max_grad_norm 1.0 \
   --wandb_project "flux-dpo-full" \
-  --max_eval_images 9 \
-  --num_eval_prompts 250 \
+  --max_eval_images 100 \
+  --num_train_prompts 75000 \
+  --num_eval_prompts 500 \
+  --prompt_seed 42 \
+  --train_test_split 0.8 \
   --output_dir "${OUTPUT_DIR}" \
   2>&1 | tee "${OUTPUT_DIR}/train.log"

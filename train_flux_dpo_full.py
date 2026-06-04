@@ -131,6 +131,57 @@ class LatentDataset(Dataset):
         }
 
 
+class LatentSubset(Dataset):
+    """Index-based view over LatentDataset that preserves prompt ordering."""
+
+    def __init__(self, dataset: LatentDataset, indices):
+        self.dataset = dataset
+        self.indices = list(indices)
+
+    def __len__(self):
+        return len(self.indices)
+
+    def __getitem__(self, idx):
+        return self.dataset[self.indices[idx]]
+
+
+def split_train_eval_indices(num_items: int, num_train: int, num_eval: int,
+                             prompt_seed: int, train_test_split: float):
+    """Match cfgrl-expo's split_and_sample_prompts index logic."""
+    rng_prompts = np.random.RandomState(prompt_seed)
+
+    if train_test_split < 1.0:
+        shuffled_idxs = rng_prompts.permutation(num_items)
+        split_point = int(num_items * train_test_split)
+        train_pool = shuffled_idxs[:split_point]
+        eval_pool = shuffled_idxs[split_point:]
+
+        rng_sample = np.random.RandomState(prompt_seed + 1)
+        n_train = min(num_train, len(train_pool))
+        n_eval = min(num_eval, len(eval_pool))
+        train_idxs = rng_sample.choice(len(train_pool), size=n_train, replace=False)
+        eval_idxs = rng_sample.choice(len(eval_pool), size=n_eval, replace=False)
+        train_indices = sorted(train_pool[train_idxs].tolist())
+        eval_indices = sorted(eval_pool[eval_idxs].tolist())
+    else:
+        n_train = min(num_train, num_items)
+        if n_train < num_items:
+            train_indices = sorted(
+                rng_prompts.choice(num_items, size=n_train, replace=False).tolist()
+            )
+        else:
+            train_indices = list(range(n_train))
+        eval_indices = train_indices
+
+    return train_indices, eval_indices
+
+
+def make_eval_episode_indices(num_eval_prompts: int, num_episodes: int, seed: int):
+    """Match cfgrl eval reset behavior: randint from eval split with replacement."""
+    rng = np.random.RandomState(seed)
+    return rng.randint(0, num_eval_prompts, size=num_episodes).tolist()
+
+
 def collate_fn(batch):
     return {
         "prompt_embeds": torch.stack([b["prompt_embeds"] for b in batch]),
@@ -604,7 +655,7 @@ def eval_hpsv2_reward(args, transformer, vae, dataset, eval_indices,
                       device, step, eval_seed=42):
     """Quantitative eval: generate 1 image per prompt, score with HPSv2.
 
-    Generates images for all prompts in eval_indices (fixed across evals),
+    Generates images for the fixed eval episode indices,
     scores them, and logs aggregate HPSv2 statistics to wandb.
 
     All ranks run transformer forward (FSDP requirement).
@@ -690,11 +741,9 @@ def eval_hpsv2_reward(args, transformer, vae, dataset, eval_indices,
             )[0]
             scores.append(img_score)
 
-            # Save first 9 images for visual inspection
-            if img_idx < 9:
-                img_path = os.path.join(images_dir, f"eval_{img_idx}.png")
-                pil_img.save(img_path)
-                wandb_images.append(wandb.Image(pil_img, caption=f"{caption[:80]}  [{img_score:.4f}]"))
+            img_path = os.path.join(images_dir, f"eval_{img_idx}.png")
+            pil_img.save(img_path)
+            wandb_images.append(wandb.Image(pil_img, caption=f"{caption[:80]}  [{img_score:.4f}]"))
 
         scores_arr = np.array(scores)
         mean_reward = float(scores_arr.mean())
@@ -723,7 +772,7 @@ def eval_hpsv2_reward(args, transformer, vae, dataset, eval_indices,
 
 @torch.no_grad()
 def eval_and_log_images(args, transformer, vae, dataset, device, step,
-                        eval_seed=42, max_images=9):
+                        eval_seed=42, max_images=100, eval_indices=None):
     """Generate images with fixed prompts/noise and log to wandb.
 
     Mirrors cfgrl-expo's evaluation: same seed resets every eval round so that
@@ -749,13 +798,17 @@ def eval_and_log_images(args, transformer, vae, dataset, device, step,
     sigmas = torch.linspace(1.0, 0.0, args.sampling_steps + 1, device=device)
     sigmas = sd3_time_shift(args.shift, sigmas)
 
-    num_eval = min(max_images, len(dataset))
+    if eval_indices is None:
+        eval_indices = list(range(min(max_images, len(dataset))))
+    else:
+        eval_indices = list(eval_indices)[:max_images]
+    num_eval = len(eval_indices)
 
     # Phase 1: all ranks run transformer forward (required by FSDP)
     all_z_packed = []
     all_captions = []
 
-    for idx in range(num_eval):
+    for idx in eval_indices:
         entry = dataset[idx]
         prompt_embeds = entry["prompt_embeds"].unsqueeze(0).to(device, dtype=torch.bfloat16)
         pooled_prompt_embeds = entry["pooled_prompt_embeds"].unsqueeze(0).to(device, dtype=torch.bfloat16)
@@ -831,7 +884,7 @@ def parse_args():
     parser.add_argument("--output_dir", type=str, default="output_dpo_flux_full")
     parser.add_argument("--h", type=int, default=512)
     parser.add_argument("--w", type=int, default=512)
-    parser.add_argument("--sampling_steps", type=int, default=8)
+    parser.add_argument("--sampling_steps", type=int, default=4)
     parser.add_argument("--shift", type=float, default=3.0)
     parser.add_argument("--guidance", type=float, default=3.5)
     parser.add_argument("--beta_dpo", type=float, default=5000.0)
@@ -850,17 +903,23 @@ def parse_args():
     parser.add_argument("--wandb_project", type=str, default="flux-dpo-full")
     parser.add_argument("--eval_every", type=int, default=0,
                         help="Eval and log images every N steps. 0 = only at checkpoints.")
-    parser.add_argument("--max_eval_images", type=int, default=9)
-    parser.add_argument("--num_eval_prompts", type=int, default=250,
-                        help="Number of fixed random prompts for quantitative HPSv2 eval.")
+    parser.add_argument("--max_eval_images", type=int, default=100,
+                        help="Number of fixed eval episodes/images generated at each eval checkpoint.")
+    parser.add_argument("--num_train_prompts", type=int, default=75000,
+                        help="Number of train prompts sampled from the train split.")
+    parser.add_argument("--num_eval_prompts", type=int, default=500,
+                        help="Number of prompts sampled into the held-out eval split.")
+    parser.add_argument("--prompt_seed", type=int, default=42,
+                        help="Seed for deterministic train/eval prompt split. Matches cfgrl-expo config.")
+    parser.add_argument("--train_test_split", type=float, default=0.8,
+                        help="Fraction of prompts used as train pool before sampling train/eval splits.")
     return parser.parse_args()
 
 
-def should_checkpoint(step):
-    """Variable checkpoint/eval schedule: every 10 for first 200, every 50 after."""
-    if step <= 200:
-        return step % 10 == 0
-    return step % 50 == 0
+def should_checkpoint(step, args):
+    """Return whether this training step should save and run eval."""
+    interval = args.eval_every if args.eval_every > 0 else args.checkpointing_steps
+    return interval > 0 and step % interval == 0
 
 
 def main():
@@ -913,12 +972,47 @@ def main():
     optimizer = torch.optim.AdamW(trainable_params, lr=args.learning_rate, weight_decay=0.0)
 
     # --- Dataset ---
-    dataset = LatentDataset(args.data_json_path)
+    full_dataset = LatentDataset(args.data_json_path)
+    train_indices, eval_pool_indices = split_train_eval_indices(
+        len(full_dataset),
+        args.num_train_prompts,
+        args.num_eval_prompts,
+        args.prompt_seed,
+        args.train_test_split,
+    )
+    train_dataset = LatentSubset(full_dataset, train_indices)
+    eval_dataset = LatentSubset(full_dataset, eval_pool_indices)
+    if len(train_dataset) == 0:
+        raise ValueError("Train split is empty. Check --num_train_prompts and --train_test_split.")
+    if len(eval_dataset) == 0:
+        raise ValueError("Eval split is empty. Check --num_eval_prompts and --train_test_split.")
+    eval_indices = make_eval_episode_indices(
+        len(eval_dataset),
+        min(args.max_eval_images, len(eval_dataset)),
+        args.seed,
+    )
+    if rank == 0:
+        split_path = os.path.join(args.output_dir, "prompt_split.json")
+        with open(split_path, "w") as f:
+            json.dump({
+                "data_json_path": args.data_json_path,
+                "num_source_prompts": len(full_dataset),
+                "num_train_prompts": len(train_dataset),
+                "num_eval_prompts": len(eval_dataset),
+                "num_eval_episodes": len(eval_indices),
+                "prompt_seed": args.prompt_seed,
+                "eval_seed": args.seed,
+                "train_test_split": args.train_test_split,
+                "train_indices": train_indices,
+                "eval_pool_indices": eval_pool_indices,
+                "eval_episode_indices": eval_indices,
+            }, f, indent=2)
+        logger.info(f"Prompt split metadata saved to {split_path}")
     sampler = torch.utils.data.distributed.DistributedSampler(
-        dataset, num_replicas=world_size, rank=rank, shuffle=True, seed=args.seed,
+        train_dataset, num_replicas=world_size, rank=rank, shuffle=True, seed=args.seed,
     )
     dataloader = DataLoader(
-        dataset, batch_size=args.train_batch_size, sampler=sampler,
+        train_dataset, batch_size=args.train_batch_size, sampler=sampler,
         collate_fn=collate_fn, num_workers=4, pin_memory=True,
     )
 
@@ -935,11 +1029,6 @@ def main():
         device, args,
     )
 
-    # --- Fixed eval prompt indices (same 250 prompts every eval) ---
-    eval_rng = np.random.RandomState(args.seed + 1000)
-    n_eval = min(args.num_eval_prompts, len(dataset))
-    eval_indices = eval_rng.choice(len(dataset), size=n_eval, replace=False).tolist()
-
     # --- Training ---
     global_step = 0
     optimizer.zero_grad()
@@ -947,19 +1036,25 @@ def main():
 
     if rank == 0:
         logger.info("Starting training...")
-        logger.info(f"  Num prompts = {len(dataset)}")
+        logger.info(f"  Num source prompts = {len(full_dataset)}")
+        logger.info(f"  Num train prompts = {len(train_dataset)}")
+        logger.info(f"  Num eval prompts = {len(eval_dataset)}")
+        logger.info(f"  Eval episodes/images per checkpoint = {len(eval_indices)}")
+        logger.info(f"  Prompt split seed = {args.prompt_seed}")
+        logger.info(f"  Eval seed = {args.seed}")
+        logger.info(f"  Sampling steps = {args.sampling_steps}")
         logger.info(f"  Batch size per GPU = {args.train_batch_size}")
         logger.info(f"  Gradient accumulation steps = {args.gradient_accumulation_steps}")
         logger.info(f"  Effective batch size = {args.train_batch_size * world_size * args.gradient_accumulation_steps}")
         logger.info(f"  Num generations per prompt = {args.num_generations}")
         logger.info(f"  Max train steps = {args.max_train_steps}")
-        logger.info(f"  Num eval prompts = {n_eval}")
-        logger.info(f"  Eval schedule: every 10 steps (first 200), every 50 after")
+        eval_interval = args.eval_every if args.eval_every > 0 else args.checkpointing_steps
+        logger.info(f"  Checkpoint/eval interval = {eval_interval}")
 
     # --- Eval baseline before training (step 0) ---
     if rank == 0:
         logger.info("Running baseline HPSv2 evaluation (step 0)...")
-    eval_hpsv2_reward(args, transformer, vae, dataset, eval_indices,
+    eval_hpsv2_reward(args, transformer, vae, eval_dataset, eval_indices,
                       hps_model, hps_preprocess, hps_tokenizer,
                       device, step=0, eval_seed=args.seed)
 
@@ -1086,11 +1181,11 @@ def main():
                             f"{metrics['implicit_acc']:.4f}\n")
 
             # === Checkpointing + HPSv2 eval (variable schedule) ===
-            if should_checkpoint(global_step + 1):
+            if should_checkpoint(global_step + 1, args):
                 # All ranks must participate in FSDP state dict gathering
                 save_full_checkpoint(transformer, optimizer, global_step + 1, args.output_dir)
-                # Quantitative HPSv2 eval on fixed 250 prompts
-                eval_hpsv2_reward(args, transformer, vae, dataset, eval_indices,
+                # Quantitative HPSv2 eval on fixed cfgrl-style eval episodes
+                eval_hpsv2_reward(args, transformer, vae, eval_dataset, eval_indices,
                                   hps_model, hps_preprocess, hps_tokenizer,
                                   device, step=global_step + 1, eval_seed=args.seed)
                 dist.barrier()
@@ -1099,12 +1194,12 @@ def main():
 
         epoch += 1
 
-    # Final save + eval (all ranks participate in FSDP state dict gathering)
-    save_full_checkpoint(transformer, optimizer, global_step, args.output_dir)
-
-    eval_hpsv2_reward(args, transformer, vae, dataset, eval_indices,
-                      hps_model, hps_preprocess, hps_tokenizer,
-                      device, step=global_step, eval_seed=args.seed)
+    # Final save + eval if the last step did not already checkpoint.
+    if not should_checkpoint(global_step, args):
+        save_full_checkpoint(transformer, optimizer, global_step, args.output_dir)
+        eval_hpsv2_reward(args, transformer, vae, eval_dataset, eval_indices,
+                          hps_model, hps_preprocess, hps_tokenizer,
+                          device, step=global_step, eval_seed=args.seed)
 
     # Print and save compute summary
     if rank == 0:
