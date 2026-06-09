@@ -1,27 +1,42 @@
 #!/bin/bash
 #
-#SBATCH --account=m5319
+# NERSC configuration:
+##SBATCH --account=m5319
+##SBATCH --job-name=dpo-flux-full
+##SBATCH --constraint=gpu&hbm80g
+##SBATCH --qos=regular
+##SBATCH --time=72:00:00
+##SBATCH --nodes=1
+##SBATCH --gpus=a100:4
+##SBATCH --cpus-per-task=16
+##SBATCH --ntasks=1
+##SBATCH --output=/pscratch/sd/v/vjayam/DiffusionDPO/slurm_logs/flux_full_%j.out
+##SBATCH --error=/pscratch/sd/v/vjayam/DiffusionDPO/slurm_logs/flux_full_%j.err
+##SBATCH --reservation=cfgrl_experiments_2
+#
+# Atlas configuration:
+#SBATCH --account=atlas
 #SBATCH --job-name=dpo-flux-full
-#SBATCH --constraint=gpu&hbm80g
-#SBATCH --qos=regular
-#SBATCH --time=72:00:00
-#SBATCH --nodes=1                # Single node
-#SBATCH --gpus=a100:4
-#SBATCH --cpus-per-task=16       # CPUs for the job
-#SBATCH --ntasks=1            # Number of tasks (one per GPU)
-#SBATCH --output=/pscratch/sd/v/vjayam/DiffusionDPO/slurm_logs/flux_full_%j.out
-#SBATCH --error=/pscratch/sd/v/vjayam/DiffusionDPO/slurm_logs/flux_full_%j.err
-#SBATCH --reservation=cfgrl_experiments_2
+#SBATCH --partition=atlas
+#SBATCH --gres=gpu:a6000ada:4
+#SBATCH --cpus-per-task=32
+#SBATCH --mem=290G
+#SBATCH --time=48:00:00
+#SBATCH --nodes=1
+#SBATCH --ntasks=1
+#SBATCH --output=/atlas2/u/vjayam/experiments/cfgrl/logs/slurm/flux_full_%j.out
+#SBATCH --error=/atlas2/u/vjayam/experiments/cfgrl/logs/slurm/flux_full_%j.err
 
 # Launch script for Online DiffusionDPO on FLUX.1-dev with full-weight finetuning (4 GPUs)
 
 # === Paths (shared with DanceGRPO baseline) ===
-DATA_DIR="${DATA_DIR:-/pscratch/sd/v/vjayam/DiffusionDPO/data}"
-HPS_CKPT_DIR="${HPS_CKPT_DIR:-/pscratch/sd/v/vjayam/DiffusionDPO/hps_ckpt}"
-OUTPUT_DIR="${OUTPUT_DIR:-/pscratch/sd/v/vjayam/DiffusionDPO/output_dpo_flux_full}"
+DATA_DIR="${DATA_DIR:-/atlas2/u/vjayam/experiments/cfgrl-expo/DanceGRPO/data}"
+HPS_CKPT_DIR="${HPS_CKPT_DIR:-/atlas2/u/vjayam/experiments/cfgrl-expo/DanceGRPO/hps_ckpt}"
+OUTPUT_DIR="${OUTPUT_DIR:-/atlas2/u/vjayam/experiments/cfgrl-expo/DiffusionDPO/output_dpo_flux_full}"
 
 # === Create output directory ===
 mkdir -p "${OUTPUT_DIR}"
+export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
 
 echo "============================================="
 echo " Online DiffusionDPO for FLUX.1-dev (Full FT)"
@@ -42,7 +57,7 @@ torchrun --nproc_per_node=4 --master_port 19003 \
   --shift 3.0 \
   --guidance 3.5 \
   --beta_dpo 5000 \
-  --num_generations 4 \
+  --num_generations 2 \
   --train_batch_size 1 \
   --gradient_accumulation_steps 12 \
   --learning_rate 1e-6 \
