@@ -20,6 +20,7 @@
 #SBATCH --cpus-per-task=32
 #SBATCH --output=/pscratch/sd/v/vjayam/DiffusionDPO/slurm_logs/flux_full_nersc_%j.out
 #SBATCH --error=/pscratch/sd/v/vjayam/DiffusionDPO/slurm_logs/flux_full_nersc_%j.err
+#SBATCH --reservation=final_runs
 
 set -euo pipefail
 
