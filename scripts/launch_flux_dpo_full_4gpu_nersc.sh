@@ -4,6 +4,7 @@
 #   sbatch scripts/launch_flux_dpo_full_4gpu_nersc.sh
 #
 # Override paths or training settings at submission time, for example:
+#   REPO_DIR=/pscratch/sd/v/vjayam/DiffusionDPO \
 #   DATA_DIR=/pscratch/sd/v/vjayam/DiffusionDPO/data \
 #   OUTPUT_DIR=/pscratch/sd/v/vjayam/DiffusionDPO/output_dpo_flux_full \
 #   sbatch scripts/launch_flux_dpo_full_4gpu_nersc.sh
@@ -22,13 +23,36 @@
 
 set -euo pipefail
 
-REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-cd "${REPO_DIR}"
-
+REPO_DIR="${REPO_DIR:-/pscratch/sd/v/vjayam/DiffusionDPO}"
 DATA_DIR="${DATA_DIR:-/pscratch/sd/v/vjayam/DiffusionDPO/data}"
 HPS_CKPT_DIR="${HPS_CKPT_DIR:-/pscratch/sd/v/vjayam/DiffusionDPO/hps_ckpt}"
 OUTPUT_DIR="${OUTPUT_DIR:-/pscratch/sd/v/vjayam/DiffusionDPO/output_dpo_flux_full}"
+TRAIN_SCRIPT="${REPO_DIR}/train_flux_dpo_full.py"
 
+# Slurm runs a copy of this file from /var/spool/slurmd, so BASH_SOURCE cannot
+# be used to locate the checkout inside an sbatch job.
+if [[ ! -f "${TRAIN_SCRIPT}" ]]; then
+  echo "Training script not found: ${TRAIN_SCRIPT}" >&2
+  echo "Set REPO_DIR to the DiffusionDPO checkout when submitting the job." >&2
+  exit 1
+fi
+if [[ ! -d "${DATA_DIR}/flux/transformer" || ! -d "${DATA_DIR}/flux/vae" ]]; then
+  echo "FLUX.1-dev weights not found under: ${DATA_DIR}/flux" >&2
+  echo "Set DATA_DIR to the DanceGRPO-compatible data directory." >&2
+  exit 1
+fi
+if [[ ! -f "${DATA_DIR}/rl_embeddings/videos2caption.json" ]]; then
+  echo "Baseline prompt embeddings not found: ${DATA_DIR}/rl_embeddings/videos2caption.json" >&2
+  echo "Set DATA_DIR to the DanceGRPO-compatible data directory." >&2
+  exit 1
+fi
+if [[ ! -f "${HPS_CKPT_DIR}/HPS_v2_compressed.pt" ]]; then
+  echo "HPSv2 checkpoint not found: ${HPS_CKPT_DIR}/HPS_v2_compressed.pt" >&2
+  echo "Set HPS_CKPT_DIR to the DanceGRPO-compatible HPS checkpoint directory." >&2
+  exit 1
+fi
+
+cd "${REPO_DIR}"
 mkdir -p "${OUTPUT_DIR}"
 
 export PYTHONUNBUFFERED=1
@@ -53,7 +77,7 @@ echo "============================================="
 
 srun --ntasks=1 --cpu-bind=cores \
   torchrun --nproc_per_node=4 --master_port "${MASTER_PORT}" \
-  train_flux_dpo_full.py \
+  "${TRAIN_SCRIPT}" \
   --pretrained_model_name_or_path "${DATA_DIR}/flux" \
   --data_json_path "${DATA_DIR}/rl_embeddings/videos2caption.json" \
   --h 512 --w 512 \
