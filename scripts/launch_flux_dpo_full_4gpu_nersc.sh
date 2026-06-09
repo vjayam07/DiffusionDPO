@@ -4,7 +4,6 @@
 #   sbatch scripts/launch_flux_dpo_full_4gpu_nersc.sh
 #
 # Override paths or training settings at submission time, for example:
-#   REPO_DIR=/pscratch/sd/v/vjayam/DiffusionDPO \
 #   DATA_DIR=/pscratch/sd/v/vjayam/DiffusionDPO/data \
 #   OUTPUT_DIR=/pscratch/sd/v/vjayam/DiffusionDPO/output_dpo_flux_full \
 #   sbatch scripts/launch_flux_dpo_full_4gpu_nersc.sh
@@ -24,17 +23,16 @@
 
 set -euo pipefail
 
-REPO_DIR="${REPO_DIR:-/pscratch/sd/v/vjayam/DiffusionDPO}"
 DATA_DIR="${DATA_DIR:-/pscratch/sd/v/vjayam/DiffusionDPO/data}"
 HPS_CKPT_DIR="${HPS_CKPT_DIR:-/pscratch/sd/v/vjayam/DiffusionDPO/hps_ckpt}"
 OUTPUT_DIR="${OUTPUT_DIR:-/pscratch/sd/v/vjayam/DiffusionDPO/output_dpo_flux_full}"
-TRAIN_SCRIPT="${REPO_DIR}/train_flux_dpo_full.py"
 
-# Slurm runs a copy of this file from /var/spool/slurmd, so BASH_SOURCE cannot
-# be used to locate the checkout inside an sbatch job.
-if [[ ! -f "${TRAIN_SCRIPT}" ]]; then
-  echo "Training script not found: ${TRAIN_SCRIPT}" >&2
-  echo "Set REPO_DIR to the DiffusionDPO checkout when submitting the job." >&2
+# Run from the directory where sbatch was invoked.
+cd "${SLURM_SUBMIT_DIR:?SLURM_SUBMIT_DIR is not set; submit this script with sbatch}"
+
+if [[ ! -f "train_flux_dpo_full.py" ]]; then
+  echo "train_flux_dpo_full.py not found in submission directory: ${SLURM_SUBMIT_DIR}" >&2
+  echo "Run sbatch from the DiffusionDPO repository root." >&2
   exit 1
 fi
 if [[ ! -d "${DATA_DIR}/flux/transformer" || ! -d "${DATA_DIR}/flux/vae" ]]; then
@@ -53,7 +51,6 @@ if [[ ! -f "${HPS_CKPT_DIR}/HPS_v2_compressed.pt" ]]; then
   exit 1
 fi
 
-cd "${REPO_DIR}"
 mkdir -p "${OUTPUT_DIR}"
 
 export PYTHONUNBUFFERED=1
@@ -68,7 +65,7 @@ echo "============================================="
 echo " Online DiffusionDPO for FLUX.1-dev (Full FT)"
 echo " NERSC Perlmutter: 4x A100 80GB"
 echo "============================================="
-echo "Repository:    ${REPO_DIR}"
+echo "Repository:    ${SLURM_SUBMIT_DIR}"
 echo "FLUX weights:  ${DATA_DIR}/flux"
 echo "Embeddings:    ${DATA_DIR}/rl_embeddings/videos2caption.json"
 echo "HPSv2 ckpt:    ${HPS_CKPT_DIR}"
@@ -78,7 +75,7 @@ echo "============================================="
 
 srun --ntasks=1 --cpu-bind=cores \
   torchrun --nproc_per_node=4 --master_port "${MASTER_PORT}" \
-  "${TRAIN_SCRIPT}" \
+  train_flux_dpo_full.py \
   --pretrained_model_name_or_path "${DATA_DIR}/flux" \
   --data_json_path "${DATA_DIR}/rl_embeddings/videos2caption.json" \
   --h 512 --w 512 \
