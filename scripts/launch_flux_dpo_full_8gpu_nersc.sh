@@ -1,24 +1,24 @@
 #!/bin/bash
 #
 # Submit from the repository root with:
-#   sbatch scripts/launch_flux_dpo_full_4gpu_nersc.sh
+#   sbatch scripts/launch_flux_dpo_full_8gpu_nersc.sh
 #
 # Override paths or training settings at submission time, for example:
 #   DATA_DIR=/pscratch/sd/v/vjayam/DiffusionDPO/data \
 #   OUTPUT_DIR=/pscratch/sd/v/vjayam/DiffusionDPO/output_dpo_flux_full \
-#   sbatch scripts/launch_flux_dpo_full_4gpu_nersc.sh
+#   sbatch scripts/launch_flux_dpo_full_8gpu_nersc.sh
 #
 #SBATCH --account=m5319
 #SBATCH --job-name=dpo-flux-full
 #SBATCH --constraint=gpu&hbm80g
 #SBATCH --qos=regular
 #SBATCH --time=48:00:00
-#SBATCH --nodes=1
-#SBATCH --ntasks=1
+#SBATCH --nodes=2
+#SBATCH --ntasks-per-node=1
 #SBATCH --gpus-per-node=4
 #SBATCH --cpus-per-task=32
-#SBATCH --output=/pscratch/sd/v/vjayam/DiffusionDPO/slurm_logs/flux_full_nersc_%j.out
-#SBATCH --error=/pscratch/sd/v/vjayam/DiffusionDPO/slurm_logs/flux_full_nersc_%j.err
+#SBATCH --output=/pscratch/sd/v/vjayam/DiffusionDPO/slurm_logs/flux_full_8gpu_nersc_%j.out
+#SBATCH --error=/pscratch/sd/v/vjayam/DiffusionDPO/slurm_logs/flux_full_8gpu_nersc_%j.err
 #SBATCH --reservation=final_runs
 
 set -euo pipefail
@@ -60,21 +60,28 @@ export NCCL_ASYNC_ERROR_HANDLING=1
 
 # Avoid collisions if multiple jobs share a node during interactive testing.
 MASTER_PORT="${MASTER_PORT:-$((19000 + SLURM_JOB_ID % 1000))}"
+MASTER_ADDR="${MASTER_ADDR:-$(scontrol show hostnames "${SLURM_JOB_NODELIST}" | sed -n '1p')}"
 
 echo "============================================="
 echo " Online DiffusionDPO for FLUX.1-dev (Full FT)"
-echo " NERSC Perlmutter: 4x A100 80GB"
+echo " NERSC Perlmutter: 8x A100 80GB across 2 nodes"
 echo "============================================="
 echo "Repository:    ${SLURM_SUBMIT_DIR}"
 echo "FLUX weights:  ${DATA_DIR}/flux"
 echo "Embeddings:    ${DATA_DIR}/rl_embeddings/videos2caption.json"
 echo "HPSv2 ckpt:    ${HPS_CKPT_DIR}"
 echo "Output:        ${OUTPUT_DIR}"
+echo "Master addr:   ${MASTER_ADDR}"
 echo "Master port:   ${MASTER_PORT}"
 echo "============================================="
 
-srun --ntasks=1 --cpu-bind=cores \
-  torchrun --nproc_per_node=4 --master_port "${MASTER_PORT}" \
+srun --ntasks="${SLURM_NNODES}" --ntasks-per-node=1 --cpu-bind=cores --gpu-bind=none \
+  torchrun \
+  --nnodes="${SLURM_NNODES}" \
+  --nproc_per_node=4 \
+  --rdzv_id="${SLURM_JOB_ID}" \
+  --rdzv_backend=c10d \
+  --rdzv_endpoint="${MASTER_ADDR}:${MASTER_PORT}" \
   train_flux_dpo_full.py \
   --pretrained_model_name_or_path "${DATA_DIR}/flux" \
   --data_json_path "${DATA_DIR}/rl_embeddings/videos2caption.json" \
@@ -85,7 +92,7 @@ srun --ntasks=1 --cpu-bind=cores \
   --beta_dpo 5000 \
   --num_generations 2 \
   --train_batch_size 1 \
-  --gradient_accumulation_steps 12 \
+  --gradient_accumulation_steps 6 \
   --learning_rate 1e-6 \
   --max_train_steps 4500 \
   --gradient_checkpointing \
